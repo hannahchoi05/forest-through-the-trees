@@ -1,57 +1,209 @@
-# Residual Momentum AP-Tree Ablation
+# Residual Momentum + AP-Trees + Transaction-Cost-Aware Portfolio Construction
 
-The code produces exactly the two methods:
+## Overview
 
-1. **Static paper-style optimizer + residual momentum tilt**
-   - Reconstructs the full AP-tree candidate set.
-   - Applies residual momentum tilt inside each AP-tree node.
-   - Uses a fixed train/validation/test split, with no rolling window.
-   - Fits one set of portfolio weights on the first `N_TRAIN_VALID` months.
-   - Applies those fixed weights to the test period.
+This project replicates and extends an AP-tree portfolio construction method by:
 
-2. **Rolling TC-aware optimizer + residual momentum tilt**
-   - Uses the same residual-momentum-tilted AP-tree candidate returns.
-   - Estimates mean/covariance on a rolling `ROLLING_WINDOW`.
-   - Adds transaction-cost turnover penalty `lambda_tc * ||w_t - w_{t-1}||_1`.
-   - Computes gross returns, turnover, costs, and net returns.
+1. Replicating AP-pruning from the paper  
+2. Adding residual momentum tilt within nodes  
+3. Converting SDF weights into tradable portfolios  
+4. Incorporating transaction-cost-aware optimization  
 
-## Run
+---
 
-```bash
-cd "ResidualMomentum"
-pip install -r requirements.txt
+## Methods
+
+We implement four portfolio construction variants:
+
+### A1 — AP-pruning (static, no transaction cost)
+
+- Faithful implementation of AP-pruning
+- Uses LASSO path to select exactly K portfolios
+- Hyperparameters selected via validation Sharpe (SDF-based)
+
+The paper produces **SDF weights**, which are not directly tradable.  
+We convert them into investable weights:
+
+```
+w_trade = w_sdf / sum(|w_sdf|)
+```
+
+No transaction costs applied.
+
+---
+
+### A2 — AP-pruning (static + stock-level transaction cost)
+
+- Same portfolio as A1
+- Applies transaction costs ex-post
+
+Turnover:
+
+```
+turnover = sum_i |w_i,t - w_i,t-1|
+```
+
+Transaction cost:
+
+```
+cost = 25 bps × turnover
+```
+
+---
+
+### B — Rolling TC-aware optimization (portfolio-level)
+
+- Rolling mean-variance optimization
+- Objective:
+
+```
+min_w 0.5 w'Σw - η w'μ + 0.5 λ2 ||w||² + λ_tc ||w - w_prev||₁
+```
+
+- Turnover computed at portfolio weight level
+
+---
+
+### C — Rolling TC-aware optimization (stock-level)
+
+- Same as B, but turnover computed at stock level:
+
+```
+turnover = sum_i |W_stock_i,t - W_stock_i,t-1|
+```
+
+- Uses AP-tree mapping from portfolio weights → stock weights
+
+---
+
+## Key Concept: SDF vs Tradable Portfolio
+
+The AP-pruning method produces **SDF (stochastic discount factor) weights**, not directly investable portfolios.
+
+Paper normalization:
+
+```
+w_sdf = b / |sum(b)|
+```
+
+This does **not control leverage**.
+
+### Our extension
+
+We construct tradable weights:
+
+```
+w_trade = w_sdf / sum(|w_sdf|)
+```
+
+This ensures:
+
+- controlled leverage  
+- stable returns  
+- meaningful cumulative wealth  
+
+---
+
+## Pipeline
+
+Run:
+
+```
 python run_all.py
 ```
 
-## Main settings
+### Steps
 
-Edit `config.py`:
+1. Load stock-level data  
+2. Compute residual momentum  
+3. Build AP-tree candidate portfolios  
+4. Generate candidate return matrix (~3000 portfolios)  
+5. Run optimization (A1/A2/B/C)  
+6. Backtest and generate metrics + plots  
 
-```python
-DEFAULT_CHARS = ["LME", "OP", "Investment"]
-DEFAULT_TREE_DEPTH = 4
-DEFAULT_TAU = 0.50
-N_TRAIN_VALID = 360
-ROLLING_WINDOW = 120
-TC_COST = 0.0025
-TC_LAMBDA_TC = 0.0025
-```
+---
 
 ## Outputs
 
 All outputs are saved under:
 
-```text
-ResidualMomentum/outputs/<chars>/
-ResidualMomentum/outputs/plots/<chars>/
+```
+outputs/<chars>/
 ```
 
-Key files:
+### Backtests
 
-- `candidate_returns_full_ap_tree_tau_*.csv`
-- `tilted_candidate_matrix_tau_*.csv`
-- `backtest_static_paper_style_plus_residual_momentum_tilt.csv`
-- `backtest_rolling_tc_aware_plus_residual_momentum_tilt.csv`
-- `backtest_comparison.csv`
-- `summary_metrics_comparison.csv`
-- Plots in PNG files.
+```
+backtest_A1_*.csv
+backtest_A2_*.csv
+backtest_B_*.csv
+backtest_C_*.csv
+backtest_comparison.csv
+backtest_comparison_with_wealth_drawdown.csv
+```
+
+### Metrics
+
+```
+summary_metrics_comparison.csv
+```
+
+Includes:
+
+- Sharpe (gross/net)  
+- turnover  
+- drawdown  
+- terminal wealth  
+
+---
+
+### Plots
+
+```
+outputs/<chars>/plots/
+```
+
+- Plot A — cumulative gross returns  
+- Plot B — cumulative net returns  
+- Plot C — gross vs net  
+- Plot D — drawdown  
+- Plot E — turnover  
+- Plot F — summary metrics  
+
+---
+
+## Configuration
+
+Key parameters in `config.py`:
+
+```python
+AP_PORT_N = 40
+ROLLING_WINDOW = 120
+
+TC_COST = 0.0025
+TC_LAMBDA_TC = 0.0025
+TC_LAMBDA_L2 = 1e-3
+
+TC_ETA = 1.0
+TC_LONG_ONLY = False
+```
+
+---
+
+## Notes
+
+- AP-pruning is replicated faithfully for model selection  
+- Trading performance uses normalized weights (`w_trade`)  
+- Transaction costs are applied only in A2, B, and C  
+- Rolling methods (B, C) provide more realistic execution dynamics  
+
+---
+
+## Summary
+
+- AP-pruning identifies sparse, high-signal portfolios  
+- Residual momentum enhances signal strength  
+- Raw SDF weights are not tradable without normalization  
+- Transaction costs significantly impact performance  
+- Stock-level turnover is more realistic than portfolio-level turnover  
+```

@@ -21,16 +21,15 @@ from config import (  # noqa: E402
     DEFAULT_Y_MAX,
     N_TRAIN_VALID,
     CV_N,
-    STATIC_LAMBDA_L1,
     STATIC_LAMBDA_L2,
     STATIC_MU0,
     LONG_ONLY,
     ROLLING_WINDOW,
     TC_COST,
-    TC_LAMBDA_L1,
     TC_LAMBDA_L2,
     TC_LAMBDA_TC,
-    TC_MU0,
+    TC_ETA,
+    TC_LONG_ONLY,
     OUTPUT_DIR,
     TS32_DIR,
 )
@@ -66,7 +65,6 @@ def main() -> None:
         panel=None,
         n_bins=DEFAULT_N_BINS,
         cv_n=CV_N,
-        lambda_l1=STATIC_LAMBDA_L1,
         lambda_l2=STATIC_LAMBDA_L2,
         mu0=STATIC_MU0,
         long_only=LONG_ONLY,
@@ -89,7 +87,6 @@ def main() -> None:
         panel=panel,
         n_bins=DEFAULT_N_BINS,
         cv_n=CV_N,
-        lambda_l1=STATIC_LAMBDA_L1,
         lambda_l2=STATIC_LAMBDA_L2,
         mu0=STATIC_MU0,
         long_only=LONG_ONLY,
@@ -111,14 +108,13 @@ def main() -> None:
         window=ROLLING_WINDOW,
         panel=None,
         n_bins=DEFAULT_N_BINS,
-        lambda_l1=TC_LAMBDA_L1,
         lambda_l2=TC_LAMBDA_L2,
         lambda_tc=TC_LAMBDA_TC,
+        eta=TC_ETA,
         cost_per_turnover=TC_COST,
-        mu0=TC_MU0,
-        long_only=LONG_ONLY,
+        long_only=TC_LONG_ONLY,
         method_name="Triple Sort rolling TC-aware + portfolio-level TC",
-        use_stock_level_turnover=False,
+        turnover_mode="portfolio",
     )
 
     bt_b.to_csv(out_dir / "backtest_triplesort_rolling_tc_port_level.csv", index=False)
@@ -133,14 +129,13 @@ def main() -> None:
         window=ROLLING_WINDOW,
         panel=panel,
         n_bins=DEFAULT_N_BINS,
-        lambda_l1=TC_LAMBDA_L1,
         lambda_l2=TC_LAMBDA_L2,
         lambda_tc=TC_LAMBDA_TC,
+        eta=TC_ETA,
         cost_per_turnover=TC_COST,
-        mu0=TC_MU0,
-        long_only=LONG_ONLY,
+        long_only=TC_LONG_ONLY,
         method_name="Triple Sort rolling TC-aware + stock-level TC",
-        use_stock_level_turnover=True,
+        turnover_mode="stock",
     )
 
     bt_c.to_csv(out_dir / "backtest_triplesort_rolling_tc_stock_level.csv", index=False)
@@ -149,12 +144,23 @@ def main() -> None:
     # ---------------------------------------------------------------------
     # Align all variants to a common calendar sample and write comparison.
     # ---------------------------------------------------------------------
-    common_start = max(bt_a1["date_dt"].min(), bt_a2["date_dt"].min(), bt_b["date_dt"].min(), bt_c["date_dt"].min())
+    common_start = max(
+        bt_a1["date_dt"].min(),
+        bt_a2["date_dt"].min(),
+        bt_b["date_dt"].min(),
+        bt_c["date_dt"].min(),
+    )
+    common_end = min(
+        bt_a1["date_dt"].max(),
+        bt_a2["date_dt"].max(),
+        bt_b["date_dt"].max(),
+        bt_c["date_dt"].max(),
+    )
 
-    bt_a1 = bt_a1[bt_a1["date_dt"] >= common_start].copy()
-    bt_a2 = bt_a2[bt_a2["date_dt"] >= common_start].copy()
-    bt_b = bt_b[bt_b["date_dt"] >= common_start].copy()
-    bt_c = bt_c[bt_c["date_dt"] >= common_start].copy()
+    bt_a1 = bt_a1[(bt_a1["date_dt"] >= common_start) & (bt_a1["date_dt"] <= common_end)].copy()
+    bt_a2 = bt_a2[(bt_a2["date_dt"] >= common_start) & (bt_a2["date_dt"] <= common_end)].copy()
+    bt_b = bt_b[(bt_b["date_dt"] >= common_start) & (bt_b["date_dt"] <= common_end)].copy()
+    bt_c = bt_c[(bt_c["date_dt"] >= common_start) & (bt_c["date_dt"] <= common_end)].copy()
 
     backtest = pd.concat([bt_a1, bt_a2, bt_b, bt_c], ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
@@ -170,4 +176,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

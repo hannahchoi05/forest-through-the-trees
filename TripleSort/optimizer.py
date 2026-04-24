@@ -15,6 +15,14 @@ def _meta_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in ["date_dt", "yy", "mm"] if c in df.columns]
 
 
+def _normalize_gross_exposure(w: np.ndarray) -> np.ndarray:
+    w = np.asarray(w, dtype=float)
+    gross = float(np.sum(np.abs(w)))
+    if not np.isfinite(gross) or gross < 1e-12:
+        return np.zeros_like(w)
+    return w / gross
+
+
 def solve_portfolio_qp(
     mu: np.ndarray,
     sigma: np.ndarray,
@@ -55,7 +63,7 @@ def solve_portfolio_qp(
         bounds = [(0.0, 1.0) for _ in range(k)]
         x0 = np.clip(w_prev, 0.0, 1.0)
     else:
-        bounds = [(-2.0, 2.0) for _ in range(k)]
+        bounds = [(-1.0, 1.0) for _ in range(k)]
         x0 = w_prev.copy()
 
     if abs(x0.sum()) < 1e-12:
@@ -69,17 +77,112 @@ def solve_portfolio_qp(
         method="SLSQP",
         bounds=bounds,
         constraints=constraints,
-        options={"maxiter": 1000, "ftol": 1e-10},
+        options={"maxiter": 500, "ftol": 1e-9, "disp": False},
     )
 
     if not res.success:
-        return np.ones(k) / k
+        # Freeze previous portfolio instead of resetting to equal weights.
+        return _normalize_gross_exposure(w_prev)
 
     w = np.asarray(res.x, dtype=float)
+    if np.any(~np.isfinite(w)):
+        return _normalize_gross_exposure(w_prev)
+
     w[np.abs(w) < 1e-12] = 0.0
+
+    # Keep static optimizer in "budget" convention (sum(w)=1) when feasible.
     if abs(w.sum()) < 1e-12:
-        return np.ones(k) / k
+        return _normalize_gross_exposure(w_prev)
     return w / w.sum()
+
+
+def solve_tc_mean_variance_qp(
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    w_prev: np.ndarray,
+    eta: float,
+    lambda_l2: float,
+    lambda_tc: float,
+    turnover_mode: str,
+    long_only: bool,
+    stock_matrix: np.ndarray | None = None,
+    prev_stock_vec: np.ndarray | None = None,
+) -> np.ndarray:
+    """
+    Rolling TC-aware ablation objective:
+        min_w 0.5 w'Σw - eta μ'w + 0.5 λ2||w||_2^2 + λtc * turnover(w)
+
+    Returned weights are gross-exposure-normalized to produce stable, investable
+    wealth series (especially for long/short configurations).
+    """
+    if turnover_mode not in {"portfolio", "stock"}:
+        raise ValueError("turnover_mode must be 'portfolio' or 'stock'.")
+
+    mu = np.asarray(mu, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    w_prev = np.asarray(w_prev, dtype=float)
+
+    k = len(mu)
+
+    sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
+    sigma = 0.5 * (sigma + sigma.T) + 1e-8 * np.eye(k)
+    mu = np.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if turnover_mode == "stock" and stock_matrix is not None and stock_matrix.size > 0:
+        M = np.asarray(stock_matrix, dtype=float)
+        if prev_stock_vec is None:
+            prev_stock_vec = np.zeros(M.shape[0])
+        else:
+            prev_stock_vec = np.asarray(prev_stock_vec, dtype=float)
+
+        def tc_penalty(w: np.ndarray) -> float:
+            return float(np.sum(np.abs(M @ w - prev_stock_vec)))
+    else:
+
+        def tc_penalty(w: np.ndarray) -> float:
+            return float(np.sum(np.abs(w - w_prev)))
+
+    def obj(w: np.ndarray) -> float:
+        return float(
+            0.5 * w @ sigma @ w
+            - float(eta) * float(w @ mu)
+            + 0.5 * float(lambda_l2) * float(np.sum(w * w))
+            + float(lambda_tc) * tc_penalty(w)
+        )
+
+    # Constrain net budget; gross exposure is normalized after solve.
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+    if long_only:
+        bounds = [(0.0, 1.0) for _ in range(k)]
+        x0 = np.clip(w_prev, 0.0, 1.0)
+    else:
+        bounds = [(-1.0, 1.0) for _ in range(k)]
+        x0 = w_prev.copy()
+
+    if abs(x0.sum()) <= 1e-12:
+        x0 = np.ones(k) / k
+    else:
+        x0 = x0 / x0.sum()
+
+    res = minimize(
+        obj,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
+        options={"maxiter": 500, "ftol": 1e-9, "disp": False},
+    )
+
+    if not res.success:
+        return _normalize_gross_exposure(w_prev)
+
+    w = np.asarray(res.x, dtype=float)
+    if np.any(~np.isfinite(w)):
+        return _normalize_gross_exposure(w_prev)
+
+    w[np.abs(w) < 1e-12] = 0.0
+    return _normalize_gross_exposure(w)
 
 
 def _final_stock_weights_for_month(
@@ -129,6 +232,57 @@ def _final_stock_weights_for_month(
         out = out / total
 
     return out
+
+
+def _stock_weight_matrix_for_month(
+    month_panel: pd.DataFrame,
+    n_bins: tuple[int, int, int],
+    feat_cols: tuple[str, str, str] = ("LME", "OP", "Investment"),
+    size_col: str = "size",
+    permno_col: str = "permno",
+) -> tuple[np.ndarray, pd.Index]:
+    """
+    Return M (n_stocks x n_ports) such that final_stock_weights = M @ w_candidate.
+    Column j contains within-bucket value weights for bucket j.
+    """
+    df = month_panel[[permno_col, size_col, *feat_cols]].copy()
+    df[permno_col] = df[permno_col].astype(str)
+    df[size_col] = df[size_col].astype(float)
+
+    df = df[df[size_col].notna() & (df[size_col] > 0)].copy()
+    if df.empty:
+        return np.zeros((0, n_bins[0] * n_bins[1] * n_bins[2])), pd.Index([])
+
+    b1 = ntile_r(df[feat_cols[0]].astype(float), n_bins[0])
+    b2 = ntile_r(df[feat_cols[1]].astype(float), n_bins[1])
+    b3 = ntile_r(df[feat_cols[2]].astype(float), n_bins[2])
+
+    ok = b1.notna() & b2.notna() & b3.notna()
+    df = df.loc[ok].copy()
+    if df.empty:
+        return np.zeros((0, n_bins[0] * n_bins[1] * n_bins[2])), pd.Index([])
+
+    b1 = b1.loc[df.index].astype(int)
+    b2 = b2.loc[df.index].astype(int)
+    b3 = b3.loc[df.index].astype(int)
+
+    n2, n3 = n_bins[1], n_bins[2]
+    bucket_id = (b1 - 1) * (n2 * n3) + (b2 - 1) * n3 + (b3 - 1) + 1
+    df["bucket_id"] = bucket_id.astype(int)
+
+    sum_size = df.groupby("bucket_id")[size_col].transform("sum")
+    df["base_w"] = df[size_col] / sum_size
+
+    permnos = pd.Index(df[permno_col].astype(str).tolist())
+    n_ports = n_bins[0] * n_bins[1] * n_bins[2]
+    M = np.zeros((len(df), n_ports), dtype=float)
+
+    # bucket_id is 1..n_ports; map to 0-indexed column.
+    cols = (df["bucket_id"].to_numpy(dtype=int) - 1).clip(0, n_ports - 1)
+    rows = np.arange(len(df), dtype=int)
+    M[rows, cols] = df["base_w"].to_numpy(dtype=float)
+
+    return M, permnos
 
 
 def _stock_turnover(curr: pd.Series, prev: pd.Series | None) -> float:
@@ -252,14 +406,13 @@ def rolling_tc_optimize(
     window: int,
     panel: pd.DataFrame | None = None,
     n_bins: tuple[int, int, int] = (2, 4, 4),
-    lambda_l1: float = 0.0,
     lambda_l2: float = 1e-3,
     lambda_tc: float = 0.0025,
+    eta: float = 1.0,
     cost_per_turnover: float = 0.0025,
-    mu0: float | None = None,
     long_only: bool = True,
     method_name: str = "Triple Sort rolling TC-aware",
-    use_stock_level_turnover: bool = False,
+    turnover_mode: str = "portfolio",
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = returns_df.copy().sort_values(["yy", "mm"]).reset_index(drop=True)
     cols = _candidate_cols(df)
@@ -275,9 +428,12 @@ def rolling_tc_optimize(
 
     meta_cols = _meta_cols(df)
 
-    if use_stock_level_turnover:
+    if turnover_mode not in {"portfolio", "stock"}:
+        raise ValueError("turnover_mode must be 'portfolio' or 'stock'.")
+
+    if turnover_mode == "stock":
         if panel is None:
-            raise ValueError("panel is required when use_stock_level_turnover=True")
+            raise ValueError("panel is required when turnover_mode='stock'")
         panel_g = panel.groupby(["yy", "mm"], sort=False)
 
     for t in range(window, len(df)):
@@ -286,26 +442,40 @@ def rolling_tc_optimize(
         mu = hist.mean(axis=0).to_numpy()
         sigma = np.cov(hist.to_numpy(), rowvar=False, ddof=1)
 
-        w = solve_portfolio_qp(
+        meta = df.iloc[t][meta_cols].to_dict()
+
+        stock_matrix = None
+        prev_stock_vec = None
+        permnos = pd.Index([])
+
+        if turnover_mode == "stock":
+            m = panel_g.get_group((int(meta["yy"]), int(meta["mm"])))
+            stock_matrix, permnos = _stock_weight_matrix_for_month(m, n_bins=n_bins)
+            if len(permnos) > 0:
+                if prev_stock_w is None:
+                    prev_stock_vec = np.zeros(len(permnos))
+                else:
+                    prev_stock_vec = prev_stock_w.reindex(permnos, fill_value=0.0).to_numpy()
+
+        w = solve_tc_mean_variance_qp(
             mu=mu,
             sigma=sigma,
             w_prev=w_prev,
-            lambda_l1=lambda_l1,
-            lambda_l2=lambda_l2,
             lambda_tc=lambda_tc,
-            mu0=mu0,
+            lambda_l2=lambda_l2,
+            eta=eta,
             long_only=long_only,
+            turnover_mode=turnover_mode,
+            stock_matrix=stock_matrix,
+            prev_stock_vec=prev_stock_vec,
         )
 
         gross = float(x.iloc[t].to_numpy() @ w)
         raw_turnover = float(np.sum(np.abs(w - w_prev)))
 
-        meta = df.iloc[t][meta_cols].to_dict()
-
-        if use_stock_level_turnover:
-            m = panel_g.get_group((int(meta["yy"]), int(meta["mm"])))
+        if turnover_mode == "stock":
             curr_stock_w = _final_stock_weights_for_month(
-                m,
+                panel_g.get_group((int(meta["yy"]), int(meta["mm"]))),
                 candidate_weights=w,
                 n_bins=n_bins,
             )
@@ -331,9 +501,8 @@ def rolling_tc_optimize(
 
         for c, wi in zip(cols, w):
             if abs(wi) > 1e-12:
-                w_rows.append({**meta, "candidate": c, "weight": float(wi)})
+                w_rows.append({**meta, "candidate": c, "weight_trade": float(wi)})
 
         w_prev = w
 
     return pd.DataFrame(rows), pd.DataFrame(w_rows)
-

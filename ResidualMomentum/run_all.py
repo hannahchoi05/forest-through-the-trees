@@ -32,7 +32,11 @@ from config import (
     RUN_FULL_TREE_SET,
     USE_STOCK_LEVEL_TURNOVER,
 )
-from data_io import load_yearly_chunks, load_market_proxy
+from data_io import (
+    load_yearly_chunks,
+    load_market_proxy,
+    load_yahoo_monthly_benchmark,
+)
 from residual_momentum import (
     add_raw_momentum_signal,
     add_market_residual_momentum_signal,
@@ -128,18 +132,9 @@ def main() -> None:
         use_stock_level_turnover=False,
     )
 
-    bt_rm_static_no_tc.to_csv(
-        out_dir / "backtest_ap_tree_rm_static_no_tc.csv",
-        index=False,
-    )
-    rm_static_no_tc_weights.to_csv(
-        out_dir / "weights_ap_tree_rm_static_no_tc.csv",
-        index=False,
-    )
-    rm_static_no_tc_diag.to_csv(
-        out_dir / "diagnostics_ap_tree_rm_static_no_tc.csv",
-        index=False,
-    )
+    bt_rm_static_no_tc.to_csv(out_dir / "backtest_ap_tree_rm_static_no_tc.csv", index=False)
+    rm_static_no_tc_weights.to_csv(out_dir / "weights_ap_tree_rm_static_no_tc.csv", index=False)
+    rm_static_no_tc_diag.to_csv(out_dir / "diagnostics_ap_tree_rm_static_no_tc.csv", index=False)
 
     # ---------------------------------------------------------------------
     # 2. AP-tree + residual momentum with static optimizer and stock-level TC.
@@ -163,18 +158,9 @@ def main() -> None:
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
-    bt_static.to_csv(
-        out_dir / "backtest_ap_tree_rm_static_stock_level_tc.csv",
-        index=False,
-    )
-    static_weights.to_csv(
-        out_dir / "weights_ap_tree_rm_static_stock_level_tc.csv",
-        index=False,
-    )
-    static_diag.to_csv(
-        out_dir / "diagnostics_ap_tree_rm_static_stock_level_tc.csv",
-        index=False,
-    )
+    bt_static.to_csv(out_dir / "backtest_ap_tree_rm_static_stock_level_tc.csv", index=False)
+    static_weights.to_csv(out_dir / "weights_ap_tree_rm_static_stock_level_tc.csv", index=False)
+    static_diag.to_csv(out_dir / "diagnostics_ap_tree_rm_static_stock_level_tc.csv", index=False)
 
     # ---------------------------------------------------------------------
     # 3. AP-tree + residual momentum with rolling TC-aware optimizer.
@@ -198,17 +184,11 @@ def main() -> None:
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
-    bt_tc.to_csv(
-        out_dir / "backtest_ap_tree_rm_rolling_tc_stock_level_tc.csv",
-        index=False,
-    )
-    tc_weights.to_csv(
-        out_dir / "weights_ap_tree_rm_rolling_tc_stock_level_tc.csv",
-        index=False,
-    )
+    bt_tc.to_csv(out_dir / "backtest_ap_tree_rm_rolling_tc_stock_level_tc.csv", index=False)
+    tc_weights.to_csv(out_dir / "weights_ap_tree_rm_rolling_tc_stock_level_tc.csv", index=False)
 
     # ---------------------------------------------------------------------
-    # Align all variants to common calendar sample.
+    # Align strategy variants to common calendar sample.
     # ---------------------------------------------------------------------
     common_start = max(
         bt_rm_static_no_tc["date_dt"].min(),
@@ -216,19 +196,69 @@ def main() -> None:
         bt_tc["date_dt"].min(),
     )
 
-    bt_rm_static_no_tc = bt_rm_static_no_tc[
-        bt_rm_static_no_tc["date_dt"] >= common_start
-    ].copy()
-    bt_static = bt_static[bt_static["date_dt"] >= common_start].copy()
-    bt_tc = bt_tc[bt_tc["date_dt"] >= common_start].copy()
-
-    backtest = pd.concat(
-        [bt_rm_static_no_tc, bt_static, bt_tc],
-        ignore_index=True,
+    common_end = min(
+        bt_rm_static_no_tc["date_dt"].max(),
+        bt_static["date_dt"].max(),
+        bt_tc["date_dt"].max(),
     )
 
-    backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
+    bt_rm_static_no_tc = bt_rm_static_no_tc[
+        (bt_rm_static_no_tc["date_dt"] >= common_start)
+        & (bt_rm_static_no_tc["date_dt"] <= common_end)
+    ].copy()
 
+    bt_static = bt_static[
+        (bt_static["date_dt"] >= common_start)
+        & (bt_static["date_dt"] <= common_end)
+    ].copy()
+
+    bt_tc = bt_tc[
+        (bt_tc["date_dt"] >= common_start)
+        & (bt_tc["date_dt"] <= common_end)
+    ].copy()
+
+    # ---------------------------------------------------------------------
+    # 4. Add S&P 500 benchmark using SPY adjusted close from Yahoo Finance.
+    # ---------------------------------------------------------------------
+    print("Loading S&P 500 benchmark from Yahoo Finance using SPY...", flush=True)
+
+    try:
+        bt_spy = load_yahoo_monthly_benchmark(
+            ticker="SPY",
+            start_date=common_start,
+            end_date=common_end,
+            method_name="S&P 500 (SPY adjusted close)",
+        )
+
+        # Keep only dates shared with the strategy backtest.
+        strategy_dates = pd.concat(
+            [
+                bt_rm_static_no_tc[["date_dt"]],
+                bt_static[["date_dt"]],
+                bt_tc[["date_dt"]],
+            ],
+            ignore_index=True,
+        )["date_dt"].drop_duplicates()
+
+        bt_spy = bt_spy[bt_spy["date_dt"].isin(strategy_dates)].copy()
+
+        print(f"SPY benchmark rows: {len(bt_spy)}", flush=True)
+
+    except Exception as e:
+        print(f"WARNING: Could not load SPY benchmark from Yahoo Finance: {e}", flush=True)
+        bt_spy = pd.DataFrame()
+
+    # ---------------------------------------------------------------------
+    # Combine and evaluate.
+    # ---------------------------------------------------------------------
+    pieces = [bt_rm_static_no_tc, bt_static, bt_tc]
+
+    if not bt_spy.empty:
+        pieces.append(bt_spy)
+
+    backtest = pd.concat(pieces, ignore_index=True)
+
+    backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
     backtest.to_csv(out_dir / "backtest_comparison.csv", index=False)
 
     enriched = add_wealth_drawdown(backtest)

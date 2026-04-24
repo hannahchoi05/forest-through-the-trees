@@ -104,9 +104,48 @@ def main() -> None:
     tilted_returns = select_candidate_matrix(candidate_returns, prefix="tilt_")
     tilted_returns.to_csv(out_dir / f"tilted_candidate_matrix_tau_{DEFAULT_TAU}.csv", index=False)
 
+    # ---------------------------------------------------------------------
+    # 1. AP-tree + residual momentum baseline:
+    #    static paper-style optimizer, NO transaction costs.
+    # ---------------------------------------------------------------------
     print(
-        "Running paper-faithful static optimization: "
-        "no rolling window, residual momentum tilt...",
+        "Running AP-tree + RM baseline: "
+        "static optimizer, no transaction costs...",
+        flush=True,
+    )
+
+    bt_rm_static_no_tc, rm_static_no_tc_weights, rm_static_no_tc_diag = static_paper_style_optimize(
+        tilted_returns,
+        n_train_valid=N_TRAIN_VALID,
+        cv_n=CV_N,
+        lambda_l1=STATIC_LAMBDA_L1,
+        lambda_l2=STATIC_LAMBDA_L2,
+        mu0=STATIC_MU0,
+        long_only=LONG_ONLY,
+        method_name="AP-tree + RM baseline (static, no TC)",
+        cost_per_turnover=0.0,
+        stock_weights=None,
+        use_stock_level_turnover=False,
+    )
+
+    bt_rm_static_no_tc.to_csv(
+        out_dir / "backtest_ap_tree_rm_static_no_tc.csv",
+        index=False,
+    )
+    rm_static_no_tc_weights.to_csv(
+        out_dir / "weights_ap_tree_rm_static_no_tc.csv",
+        index=False,
+    )
+    rm_static_no_tc_diag.to_csv(
+        out_dir / "diagnostics_ap_tree_rm_static_no_tc.csv",
+        index=False,
+    )
+
+    # ---------------------------------------------------------------------
+    # 2. AP-tree + residual momentum with static optimizer and stock-level TC.
+    # ---------------------------------------------------------------------
+    print(
+        "Running AP-tree + RM static optimizer with stock-level transaction costs...",
         flush=True,
     )
 
@@ -118,25 +157,30 @@ def main() -> None:
         lambda_l2=STATIC_LAMBDA_L2,
         mu0=STATIC_MU0,
         long_only=LONG_ONLY,
-        method_name="Static paper-style optimizer + residual momentum tilt",
+        method_name="AP-tree + RM static + stock-level TC",
         cost_per_turnover=TC_COST,
         stock_weights=stock_weights,
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
     bt_static.to_csv(
-        out_dir / "backtest_static_paper_style_plus_residual_momentum_tilt.csv",
+        out_dir / "backtest_ap_tree_rm_static_stock_level_tc.csv",
         index=False,
     )
     static_weights.to_csv(
-        out_dir / "weights_static_paper_style_plus_residual_momentum_tilt.csv",
+        out_dir / "weights_ap_tree_rm_static_stock_level_tc.csv",
         index=False,
     )
-    static_diag.to_csv(out_dir / "diagnostics_static_train_valid_test.csv", index=False)
+    static_diag.to_csv(
+        out_dir / "diagnostics_ap_tree_rm_static_stock_level_tc.csv",
+        index=False,
+    )
 
+    # ---------------------------------------------------------------------
+    # 3. AP-tree + residual momentum with rolling TC-aware optimizer.
+    # ---------------------------------------------------------------------
     print(
-        "Running rolling TC-aware optimization: "
-        "residual momentum tilt + transaction cost penalty...",
+        "Running AP-tree + RM rolling TC-aware optimizer with stock-level transaction costs...",
         flush=True,
     )
 
@@ -149,25 +193,40 @@ def main() -> None:
         cost_per_turnover=TC_COST,
         mu0=TC_MU0,
         long_only=LONG_ONLY,
-        method_name="Rolling TC-aware optimizer + residual momentum tilt",
+        method_name="AP-tree + RM rolling TC-aware + stock-level TC",
         stock_weights=stock_weights,
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
     bt_tc.to_csv(
-        out_dir / "backtest_rolling_tc_aware_plus_residual_momentum_tilt.csv",
+        out_dir / "backtest_ap_tree_rm_rolling_tc_stock_level_tc.csv",
         index=False,
     )
     tc_weights.to_csv(
-        out_dir / "weights_rolling_tc_aware_plus_residual_momentum_tilt.csv",
+        out_dir / "weights_ap_tree_rm_rolling_tc_stock_level_tc.csv",
         index=False,
     )
 
-    common_start = max(bt_static["date_dt"].min(), bt_tc["date_dt"].min())
+    # ---------------------------------------------------------------------
+    # Align all variants to common calendar sample.
+    # ---------------------------------------------------------------------
+    common_start = max(
+        bt_rm_static_no_tc["date_dt"].min(),
+        bt_static["date_dt"].min(),
+        bt_tc["date_dt"].min(),
+    )
+
+    bt_rm_static_no_tc = bt_rm_static_no_tc[
+        bt_rm_static_no_tc["date_dt"] >= common_start
+    ].copy()
     bt_static = bt_static[bt_static["date_dt"] >= common_start].copy()
     bt_tc = bt_tc[bt_tc["date_dt"] >= common_start].copy()
 
-    backtest = pd.concat([bt_static, bt_tc], ignore_index=True)
+    backtest = pd.concat(
+        [bt_rm_static_no_tc, bt_static, bt_tc],
+        ignore_index=True,
+    )
+
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
 
     backtest.to_csv(out_dir / "backtest_comparison.csv", index=False)

@@ -12,7 +12,7 @@ def _candidate_cols(df: pd.DataFrame) -> list[str]:
 
 
 def _meta_cols(df: pd.DataFrame) -> list[str]:
-    return [c for c in ["date_dt", "yy", "mm"] if c in df.columns]
+    return [c for c in ["date", "date_dt", "yy", "mm"] if c in df.columns]
 
 
 def _normalize_gross_exposure(w: np.ndarray) -> np.ndarray:
@@ -376,27 +376,44 @@ def static_paper_style_optimize(
         .reset_index(drop=True)
     )
 
+    def _safe_sr(xr: np.ndarray) -> float:
+        xr = np.asarray(xr, dtype=float)
+        xr = xr[np.isfinite(xr)]
+        if len(xr) < 2:
+            return np.nan
+        sd = xr.std(ddof=1)
+        if not np.isfinite(sd) or sd < 1e-12:
+            return np.nan
+        return float(xr.mean() / sd)
+
     n_valid = int(n_train_valid / cv_n)
     n_train = n_train_valid - n_valid
 
-    train_ret = x.iloc[:n_train].to_numpy() @ w
-    valid_ret = x.iloc[n_train:n_train_valid].to_numpy() @ w
-    test_ret = gross
+    cv_train_ret = x.iloc[:n_train].to_numpy() @ w
+    cv_valid_ret = x.iloc[n_train:n_train_valid].to_numpy() @ w
+    full_train_valid_ret = x.iloc[:n_train_valid].to_numpy() @ w
+    test_ret = x.iloc[n_train_valid:].to_numpy() @ w
 
+    # Triple Sort has no SDF-vs-trade distinction; keep both columns equal.
     diag = pd.DataFrame(
         {
-            "sample": ["train", "valid", "test"],
-            "start_row": [0, n_train, n_train_valid],
-            "end_row_exclusive": [n_train, n_train_valid, len(df)],
-            "mean_monthly": [np.mean(train_ret), np.mean(valid_ret), np.mean(test_ret)],
-            "std_monthly": [
-                np.std(train_ret, ddof=1),
-                np.std(valid_ret, ddof=1),
-                np.std(test_ret, ddof=1),
+            "sample": ["cv_train", "cv_valid", "full_train_valid", "test"],
+            "start_row": [0, n_train, 0, n_train_valid],
+            "end_row_exclusive": [n_train, n_train_valid, n_train_valid, len(df)],
+            "sharpe_sdf_monthly": [
+                _safe_sr(cv_train_ret),
+                _safe_sr(cv_valid_ret),
+                _safe_sr(full_train_valid_ret),
+                _safe_sr(test_ret),
+            ],
+            "sharpe_trade_monthly": [
+                _safe_sr(cv_train_ret),
+                _safe_sr(cv_valid_ret),
+                _safe_sr(full_train_valid_ret),
+                _safe_sr(test_ret),
             ],
         }
     )
-    diag["sharpe_ann"] = np.sqrt(12.0) * diag["mean_monthly"] / diag["std_monthly"]
 
     return result.reset_index(drop=True), weights, diag
 

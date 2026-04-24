@@ -38,6 +38,7 @@ from check_portfolios import check_all  # noqa: E402
 from data_io import (  # noqa: E402
     load_triplesort_excess_returns,
     load_yearly_chunks,
+    load_yahoo_monthly_benchmark,
     load_sp500_proxy,
 )
 from optimizer import static_paper_style_optimize, rolling_tc_optimize  # noqa: E402
@@ -181,15 +182,25 @@ def main() -> None:
 
     pieces = [bt_a1, bt_a2, bt_b, bt_c]
 
-    # Add S&P 500 benchmark (local proxy from tradable_factors.csv).
+    # Add S&P 500 benchmark (prefer Yahoo SPY adjusted close; fall back to factor proxy).
     try:
-        bt_sp = load_sp500_proxy(FACTOR_DIR)
-        bt_sp = bt_sp[
-            (bt_sp["date_dt"] >= common_start) & (bt_sp["date_dt"] <= common_end)
-        ].copy()
+        bt_sp = load_yahoo_monthly_benchmark(
+            ticker="SPY",
+            start_date=common_start,
+            end_date=common_end,
+            method_name="S&P 500 (SPY adjusted close)",
+        )
         pieces.append(bt_sp)
     except Exception as e:
-        print(f"WARNING: Could not load S&P 500 proxy benchmark: {e}", flush=True)
+        print(f"WARNING: Could not load Yahoo SPY benchmark: {e}", flush=True)
+        try:
+            bt_sp = load_sp500_proxy(FACTOR_DIR, method_name="S&P 500 (Mkt-RF + rf proxy)")
+            bt_sp = bt_sp[
+                (bt_sp["date_dt"] >= common_start) & (bt_sp["date_dt"] <= common_end)
+            ].copy()
+            pieces.append(bt_sp)
+        except Exception as e2:
+            print(f"WARNING: Could not load S&P 500 proxy benchmark: {e2}", flush=True)
 
     backtest = pd.concat(pieces, ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)

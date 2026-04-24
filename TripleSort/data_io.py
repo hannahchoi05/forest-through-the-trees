@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import pandas as pd
+import yfinance as yf
 
 from utils import month_end_from_yy_mm
 
@@ -63,12 +64,83 @@ def load_triplesort_excess_returns(
     rename = {c: "port_" + c for c in raw.columns}
     ports = raw.rename(columns=rename)
     out = pd.concat([idx, ports], axis=1)
+    out["date"] = out["date_dt"].dt.strftime("%Y%m%d").astype(int)
 
     # Treat missing candidate returns as 0.0 (consistent with upstream generation).
     for c in ports.columns:
         out[c] = out[c].astype(float).fillna(0.0)
 
-    return out
+    cols = ["date", "date_dt", "yy", "mm"] + list(ports.columns)
+    return out[cols]
+
+
+def load_yahoo_monthly_benchmark(
+    ticker: str,
+    start_date,
+    end_date,
+    method_name: str = "S&P 500 (SPY adjusted close)",
+) -> pd.DataFrame:
+    """
+    Load a monthly benchmark from Yahoo Finance using adjusted close.
+
+    Output matches the backtest schema:
+        date, date_dt, yy, mm, method, gross_ret, turnover_raw, turnover, cost, net_ret
+    """
+    start_date = pd.to_datetime(start_date)
+    end_date = pd.to_datetime(end_date)
+
+    download_start = start_date - pd.DateOffset(months=2)
+    download_end = end_date + pd.DateOffset(days=5)
+
+    px = yf.download(
+        ticker,
+        start=download_start.strftime("%Y-%m-%d"),
+        end=download_end.strftime("%Y-%m-%d"),
+        auto_adjust=False,
+        progress=False,
+    )
+
+    if px.empty:
+        raise ValueError(f"Yahoo Finance returned no data for ticker={ticker}")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        px.columns = [c[0] for c in px.columns]
+
+    price_col = "Adj Close" if "Adj Close" in px.columns else "Close"
+
+    monthly_price = px[price_col].resample("ME").last()
+    monthly_ret = monthly_price.pct_change().dropna()
+
+    out = monthly_ret.rename("gross_ret").reset_index()
+    out = out.rename(columns={"Date": "date_dt"})
+
+    out["date_dt"] = pd.to_datetime(out["date_dt"]) + pd.offsets.MonthEnd(0)
+    out = out[(out["date_dt"] >= start_date) & (out["date_dt"] <= end_date)].copy()
+
+    out["date"] = out["date_dt"].dt.strftime("%Y%m%d").astype(int)
+    out["yy"] = out["date_dt"].dt.year.astype(int)
+    out["mm"] = out["date_dt"].dt.month.astype(int)
+
+    out["method"] = method_name
+    out["turnover_raw"] = 0.0
+    out["turnover"] = 0.0
+    out["cost"] = 0.0
+    out["net_ret"] = out["gross_ret"]
+
+    return out[
+        [
+            "date",
+            "date_dt",
+            "yy",
+            "mm",
+            "method",
+            "gross_ret",
+            "turnover_raw",
+            "turnover",
+            "cost",
+            "net_ret",
+        ]
+    ].reset_index(drop=True)
 
 
 def load_sp500_proxy(
@@ -101,6 +173,7 @@ def load_sp500_proxy(
 
     out = pd.DataFrame({"yy": yy, "mm": mm})
     out["date_dt"] = month_end_from_yy_mm(out)
+    out["date"] = out["date_dt"].dt.strftime("%Y%m%d").astype(int)
 
     gross = fac["Mkt-RF"].astype(float) + rf.astype(float)
 

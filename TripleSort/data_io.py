@@ -70,3 +70,45 @@ def load_triplesort_excess_returns(
 
     return out
 
+
+def load_sp500_proxy(
+    factor_dir: Path,
+    method_name: str = "S&P 500 (SPY adjusted close)",
+) -> pd.DataFrame:
+    """
+    Build a monthly S&P 500 benchmark series from Data/factor/tradable_factors.csv.
+
+    Uses: gross_ret = (Mkt-RF) + rf
+    and sets net_ret = gross_ret (no transaction costs).
+    """
+    f = factor_dir / "tradable_factors.csv"
+    fac = pd.read_csv(f)
+
+    if "Date" not in fac.columns:
+        raise ValueError("tradable_factors.csv missing 'Date' column")
+    if "Mkt-RF" not in fac.columns:
+        raise ValueError("tradable_factors.csv missing 'Mkt-RF' column")
+
+    if "rf" in fac.columns:
+        rf = fac["rf"].astype(float)
+    else:
+        rf_file = factor_dir / "rf_factor.csv"
+        rf = pd.read_csv(rf_file, header=None).squeeze().astype(float) / 100.0
+
+    yymm = fac["Date"].astype(int)
+    yy = (yymm // 100).astype(int)
+    mm = (yymm % 100).astype(int)
+
+    out = pd.DataFrame({"yy": yy, "mm": mm})
+    out["date_dt"] = month_end_from_yy_mm(out)
+
+    gross = fac["Mkt-RF"].astype(float) + rf.astype(float)
+
+    out["method"] = method_name
+    out["gross_ret"] = gross.to_numpy()
+    out["turnover_raw"] = 0.0
+    out["turnover"] = 0.0
+    out["cost"] = 0.0
+    out["net_ret"] = out["gross_ret"]
+
+    return out.sort_values(["yy", "mm"]).reset_index(drop=True)

@@ -39,8 +39,12 @@ def performance_metrics(backtest: pd.DataFrame) -> pd.DataFrame:
                 "n_months": len(g),
                 "start_date": g["date_dt"].min() if "date_dt" in g else None,
                 "end_date": g["date_dt"].max() if "date_dt" in g else None,
+                "mean_gross_monthly": gross.mean(),
+                "mean_net_monthly": net.mean(),
                 "mean_gross_ann": 12.0 * gross.mean(),
                 "mean_net_ann": 12.0 * net.mean(),
+                "vol_gross_monthly": gross_sd,
+                "vol_net_monthly": net_sd,
                 "vol_gross_ann": np.sqrt(12.0) * gross_sd,
                 "vol_net_ann": np.sqrt(12.0) * net_sd,
                 "sharpe_gross_ann": sr_gross,
@@ -58,4 +62,3 @@ def performance_metrics(backtest: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
-

@@ -30,13 +30,18 @@ from config import (  # noqa: E402
     TC_LAMBDA_TC,
     TC_ETA,
     TC_LONG_ONLY,
+    FACTOR_DIR,
     OUTPUT_DIR,
     TS32_DIR,
 )
 from check_portfolios import check_all  # noqa: E402
-from data_io import load_triplesort_excess_returns, load_yearly_chunks  # noqa: E402
+from data_io import (  # noqa: E402
+    load_triplesort_excess_returns,
+    load_yearly_chunks,
+    load_sp500_proxy,
+)
 from optimizer import static_paper_style_optimize, rolling_tc_optimize  # noqa: E402
-from metrics import performance_metrics  # noqa: E402
+from metrics import performance_metrics, add_wealth_drawdown  # noqa: E402
 
 
 def main() -> None:
@@ -142,6 +147,18 @@ def main() -> None:
     w_c.to_csv(out_dir / "weights_triplesort_rolling_tc_stock_level.csv", index=False)
 
     # ---------------------------------------------------------------------
+    # Write residual_momentum-style filenames (A1/A2/B/C).
+    # ---------------------------------------------------------------------
+    bt_a1.to_csv(out_dir / "backtest_A1_triple_sort_static_no_tc.csv", index=False)
+    diag_a1.to_csv(out_dir / "diagnostics_A1_triple_sort_static_no_tc.csv", index=False)
+
+    bt_a2.to_csv(out_dir / "backtest_A2_triple_sort_static_stock_level_tc.csv", index=False)
+    diag_a2.to_csv(out_dir / "diagnostics_A2_triple_sort_static_stock_level_tc.csv", index=False)
+
+    bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
+    bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv", index=False)
+
+    # ---------------------------------------------------------------------
     # Align all variants to a common calendar sample and write comparison.
     # ---------------------------------------------------------------------
     common_start = max(
@@ -162,11 +179,51 @@ def main() -> None:
     bt_b = bt_b[(bt_b["date_dt"] >= common_start) & (bt_b["date_dt"] <= common_end)].copy()
     bt_c = bt_c[(bt_c["date_dt"] >= common_start) & (bt_c["date_dt"] <= common_end)].copy()
 
-    backtest = pd.concat([bt_a1, bt_a2, bt_b, bt_c], ignore_index=True)
+    pieces = [bt_a1, bt_a2, bt_b, bt_c]
+
+    # Add S&P 500 benchmark (local proxy from tradable_factors.csv).
+    try:
+        bt_sp = load_sp500_proxy(FACTOR_DIR)
+        bt_sp = bt_sp[
+            (bt_sp["date_dt"] >= common_start) & (bt_sp["date_dt"] <= common_end)
+        ].copy()
+        pieces.append(bt_sp)
+    except Exception as e:
+        print(f"WARNING: Could not load S&P 500 proxy benchmark: {e}", flush=True)
+
+    backtest = pd.concat(pieces, ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
     backtest.to_csv(out_dir / "backtest_comparison.csv", index=False)
 
+    enriched = add_wealth_drawdown(backtest)
+    enriched.to_csv(out_dir / "backtest_comparison_with_wealth_drawdown.csv", index=False)
+
     metrics = performance_metrics(backtest)
+    ordered_cols = [
+        "method",
+        "n_months",
+        "start_date",
+        "end_date",
+        "mean_gross_monthly",
+        "mean_net_monthly",
+        "mean_gross_ann",
+        "mean_net_ann",
+        "vol_gross_monthly",
+        "vol_net_monthly",
+        "vol_gross_ann",
+        "vol_net_ann",
+        "sharpe_gross_ann",
+        "sharpe_net_ann",
+        "sharpe_decay_due_to_costs",
+        "hit_rate_gross",
+        "hit_rate_net",
+        "avg_turnover",
+        "avg_cost",
+        "max_drawdown_net",
+        "terminal_wealth_gross",
+        "terminal_wealth_net",
+    ]
+    metrics = metrics[[c for c in ordered_cols if c in metrics.columns]]
     metrics.to_csv(out_dir / "summary_metrics_comparison.csv", index=False)
 
     print("\nSummary metrics:", flush=True)

@@ -36,18 +36,18 @@ def _candidate_to_node_id(candidate: str) -> str:
 
 def _node_depth_from_candidate(candidate: str) -> int:
     """
-    Python candidate names are expected to look like:
+    Candidate names are expected to look like:
         port_T1111_N1
         port_T1111_N11
         port_T1111_N111
         ...
 
-    R code computes depths from tree column names and then:
-        adj_w = 1 / sqrt(2^depths)
+    Node path "1" has depth 0.
+    Node path "11" has depth 1.
+    Node path "11111" has depth 4.
 
-    For node path "1" depth = 0.
-    For node path "11" depth = 1.
-    For node path "11111" depth = 4.
+    R AP_Pruning.R uses:
+        adj_w = 1 / sqrt(2^depths)
     """
     node_id = _candidate_to_node_id(candidate)
     if "_N" not in node_id:
@@ -70,6 +70,21 @@ def _safe_sr(x: np.ndarray) -> float:
     if not np.isfinite(sd) or sd < 1e-12:
         return np.nan
     return float(x.mean() / sd)
+
+
+def _normalize_gross_exposure(w: np.ndarray) -> np.ndarray:
+    """
+    Convert SDF/path weights into an investable trading-weight convention.
+
+    This is deliberately separate from the faithful R-style AP-pruning weights.
+    Paper replication diagnostics use the original SDF weights.
+    Wealth plots / TC / backtest returns use this gross-normalized version.
+    """
+    w = np.asarray(w, dtype=float)
+    gross = float(np.sum(np.abs(w)))
+    if not np.isfinite(gross) or gross < 1e-12:
+        return np.zeros_like(w)
+    return w / gross
 
 
 def _prep_stock_weights(stock_weights):
@@ -97,12 +112,9 @@ def _prep_stock_weights(stock_weights):
 
 
 def _load_month_stock_weights_from_dir(stock_weights_dir: Path, meta: dict) -> pd.DataFrame:
-    # Your RM pipeline writes Parquet as YYYY_M.parquet? Current code writes f"{yy}_{mm:02d}.parquet".
     file_path = stock_weights_dir / f"{int(meta['yy'])}_{int(meta['mm']):02d}.parquet"
-
     if not file_path.exists():
         return pd.DataFrame()
-
     return pd.read_parquet(file_path)
 
 
@@ -160,8 +172,6 @@ def _month_stock_weights(
     out = m.groupby("permno")["final_stock_w"].sum()
     out = out[out.abs() > 1e-14]
 
-    # Do NOT force sum-to-one for long-short/SDF weights.
-    # Turnover should reflect the actual implied stock exposure from the selected SDF weights.
     return out
 
 
@@ -241,9 +251,11 @@ class APPruningSelection:
     lambda0: float
     lambda2: float
     portsN: int
-    cv_valid_sr: float
-    full_train_sr: float
-    full_test_sr: float
+    cv_valid_sr_sdf: float
+    full_train_sr_sdf: float
+    full_test_sr_sdf: float
+    full_train_sr_trade: float
+    full_test_sr_trade: float
 
 
 def _r_style_lasso_path(
@@ -254,7 +266,7 @@ def _r_style_lasso_path(
     kmax: int,
 ) -> list[dict]:
     """
-    Faithful counterpart of lasso.R:
+    Counterpart of lasso.R:
 
         yy = c(y, rep(0, p))
         XX = rbind(X, diag(sqrt(lambda2), p, p))
@@ -266,7 +278,7 @@ def _r_style_lasso_path(
         K = apply(beta, 1, function(x) sum(x != 0))
         subset = K >= kmin & K <= kmax
 
-    Returns lasso path rows in path order. No candidate pre-cap.
+    No candidate pre-cap.
     """
     if lars_path is None:
         raise ImportError("Install scikit-learn: pip install scikit-learn")
@@ -275,7 +287,6 @@ def _r_style_lasso_path(
     X_aug = np.vstack([sigma_tilde, np.sqrt(lambda2) * np.eye(p)])
     y_aug = np.concatenate([mu_tilde, np.zeros(p)])
 
-    # sklearn lars_path gives path coefficients in order.
     _, _, coefs = lars_path(
         X_aug,
         y_aug,
@@ -292,13 +303,7 @@ def _r_style_lasso_path(
         portsN = int(np.sum(beta != 0.0))
 
         if kmin <= portsN <= kmax:
-            rows.append(
-                {
-                    "step": step,
-                    "beta": beta,
-                    "portsN": portsN,
-                }
-            )
+            rows.append({"step": step, "beta": beta, "portsN": portsN})
 
     return rows
 
@@ -314,22 +319,16 @@ def _ap_pruning_run_one(
     kmax: int,
 ) -> list[dict]:
     """
-    Faithful counterpart of lasso_cv_helper for one lambda0/lambda2 pair.
+    For one lambda0/lambda2 pair, this follows the R AP-pruning calculation.
 
-    In AP_Pruning.R:
-      - if IsTree: adj_ports[, i] = ports[, i] * adj_w[i]
-      - lasso_valid_full receives adj_ports
-
-    In lasso_cv_helper:
-      - mu/sigma are estimated on adjusted ports_train
-      - lasso is run on sigma_tilde/mu_tilde
-      - beta path is adjusted:
-            b = beta * adj_w
-            b = b / abs(sum(b))
-      - SDF return is:
-            sdf = ports_train %*% (b / adj_w)
-        where ports_train here is adjusted ports_train.
-        Algebraically this equals raw_ports_train %*% b.
+    Important:
+    - `weights_sdf` is the faithful R-style SDF/path weight:
+          b = beta * adj_w
+          b = b / abs(sum(b))
+    - `weights_trade` is the investable plotting/TC version:
+          b_trade = b / sum(abs(b))
+      This is NOT used to select lambda0/lambda2; it is only used for wealth
+      plots and transaction-cost analysis.
     """
     ports_train_adj = ports_train_raw * adj_w
 
@@ -340,7 +339,6 @@ def _ap_pruning_run_one(
 
     eigvals, eigvecs = np.linalg.eigh(sigma)
     keep = eigvals > 1e-10
-
     if keep.sum() == 0:
         return []
 
@@ -348,12 +346,7 @@ def _ap_pruning_run_one(
     V = eigvecs[:, keep]
 
     sigma_tilde = V @ np.diag(np.sqrt(D)) @ V.T
-
     mu_bar = float(mu.mean())
-
-    # R:
-    # mu_tilde = V %*% diag(1/sqrt(D)) %*% t(V) %*%
-    #   (mu + lambda0 * mu_bar)
     mu_tilde = V @ np.diag(1.0 / np.sqrt(D)) @ V.T @ (mu + lambda0 * mu_bar)
 
     path_rows = _r_style_lasso_path(
@@ -369,39 +362,42 @@ def _ap_pruning_run_one(
     for row in path_rows:
         beta = row["beta"]
 
-        # R:
-        # b = beta
-        # b = b * adj_w
-        # b = b / abs(sum(b))
-        b = beta * adj_w
-        denom = abs(float(np.sum(b)))
+        # Faithful R-style SDF/path weight.
+        b_sdf = beta * adj_w
+        denom = abs(float(np.sum(b_sdf)))
 
         if not np.isfinite(denom) or denom < 1e-12:
             continue
 
-        b = b / denom
+        b_sdf = b_sdf / denom
 
-        train_ret = ports_train_raw @ b
-        valid_ret = ports_valid_raw @ b if ports_valid_raw is not None else None
-        test_ret = ports_test_raw @ b
+        # Investable version for wealth plots / TC.
+        b_trade = _normalize_gross_exposure(b_sdf)
+        if np.sum(np.abs(b_trade)) < 1e-12:
+            continue
+
+        train_sdf_ret = ports_train_raw @ b_sdf
+        test_sdf_ret = ports_test_raw @ b_sdf
+
+        train_trade_ret = ports_train_raw @ b_trade
+        test_trade_ret = ports_test_raw @ b_trade
 
         record = {
-            "train_SR": _safe_sr(train_ret),
-            "test_SR": _safe_sr(test_ret),
+            "train_SR_sdf": _safe_sr(train_sdf_ret),
+            "test_SR_sdf": _safe_sr(test_sdf_ret),
+            "train_SR_trade": _safe_sr(train_trade_ret),
+            "test_SR_trade": _safe_sr(test_trade_ret),
             "portsN": int(row["portsN"]),
-            "weights": b,
+            "weights_sdf": b_sdf,
+            "weights_trade": b_trade,
             "step": row["step"],
         }
 
         if ports_valid_raw is not None:
-            record = {
-                "train_SR": record["train_SR"],
-                "valid_SR": _safe_sr(valid_ret),
-                "test_SR": record["test_SR"],
-                "portsN": record["portsN"],
-                "weights": record["weights"],
-                "step": record["step"],
-            }
+            valid_sdf_ret = ports_valid_raw @ b_sdf
+            valid_trade_ret = ports_valid_raw @ b_trade
+            record["valid_SR_sdf"] = _safe_sr(valid_sdf_ret)
+            record["valid_SR_trade"] = _safe_sr(valid_trade_ret)
 
         out.append(record)
 
@@ -423,26 +419,14 @@ def ap_pruning_static_optimize(
     use_stock_level_turnover: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, APPruningSelection]:
     """
-    Faithful static AP-pruning + optional TC ex-post ablation.
+    Static AP-pruning with two outputs:
+      1. Faithful SDF weights/diagnostics for replication.
+      2. Gross-normalized trading weights for backtest, cumulative wealth plots, and TC.
 
-    Replication part:
-      - exactly follows the structure of lasso_valid_full.R and Pick_Best_Lambda.R:
-          * uses cv_3 by default if cv_n=3 and runFullCV=False analogue
-          * grid over lambda0 and lambda2
-          * lasso path rows filtered by kmin/kmax
-          * pick exact portsN == port_n
-          * choose lambda0/lambda2 by validation SR
-          * use results_full_l0_i_l2_j row with exact portsN == port_n
-            and take the FIRST row
-
-    No nearest-K fallback.
-    No pre-lasso candidate cap.
-    No best-train-SR replacement in full refit.
-
-    TC ablation:
-      - cost_per_turnover=0: A1, pure replication gross/net same
-      - cost_per_turnover>0 and stock_weights provided: A2, same static weights,
-        stock-level TC applied ex-post
+    The hyperparameter selection still follows the R-code style:
+      - exact portsN == port_n
+      - validation Sharpe on SDF payoff, not trading-normalized payoff
+      - first exact row, no nearest-K fallback
     """
     df = returns_df.copy().sort_values(["yy", "mm"]).reset_index(drop=True)
 
@@ -466,9 +450,6 @@ def ap_pruning_static_optimize(
     ports_train_valid = raw[:n_train_valid]
     ports_test = raw[n_train_valid:]
 
-    # ------------------------------------------------------------
-    # CV pass: R non-full-CV analogue uses cv_3 only.
-    # ------------------------------------------------------------
     cv_table = {}
     best_valid_sr = -np.inf
     best_i = None
@@ -493,13 +474,11 @@ def ap_pruning_static_optimize(
                 raise RuntimeError(
                     f"No lasso-path row with portsN == {port_n} for "
                     f"lambda0 index {i}, lambda2 index {j}. "
-                    f"This matches R behavior: exact portN is required."
+                    f"Exact portN is required."
                 )
 
-            # Pick_Best_Lambda.R:
-            # cv_data[cv_data$portsN == portN,][1,2]
             first = exact_rows[0]
-            valid_sr = float(first["valid_SR"])
+            valid_sr = float(first["valid_SR_sdf"])
             cv_table[(i, j)] = first
 
             if np.isfinite(valid_sr) and valid_sr > best_valid_sr:
@@ -513,11 +492,6 @@ def ap_pruning_static_optimize(
     lambda0_best = float(lambda0_grid[best_i - 1])
     lambda2_best = float(lambda2_grid[best_j - 1])
 
-    # ------------------------------------------------------------
-    # Full refit: R lasso_valid_full refits on ports[1:n_train_valid,]
-    # Then Pick_Best_Lambda.R takes:
-    #   full_data[full_data$portsN == portN,][1, ...]
-    # ------------------------------------------------------------
     full_rows = _ap_pruning_run_one(
         ports_train_raw=ports_train_valid,
         ports_valid_raw=None,
@@ -534,20 +508,25 @@ def ap_pruning_static_optimize(
     if not exact_full_rows:
         raise RuntimeError(
             f"Full refit has no lasso-path row with portsN == {port_n}. "
-            f"This matches R behavior: exact portN is required."
+            f"Exact portN is required."
         )
 
     full_first = exact_full_rows[0]
-    w = np.asarray(full_first["weights"], dtype=float)
 
-    gross = ports_test @ w
+    w_sdf = np.asarray(full_first["weights_sdf"], dtype=float)
+    w_trade = np.asarray(full_first["weights_trade"], dtype=float)
+
+    # Backtest/wealth plots use investable gross-normalized weights.
+    gross_trade = ports_test @ w_trade
+    gross_sdf = ports_test @ w_sdf
 
     result = df.iloc[n_train_valid:][meta_cols].copy()
     result["method"] = method_name
-    result["gross_ret"] = gross
+    result["gross_ret"] = gross_trade
+    result["sdf_ret"] = gross_sdf
 
     sw = _prep_stock_weights(stock_weights)
-    candidate_w = pd.Series(w, index=cols)
+    candidate_w_trade = pd.Series(w_trade, index=cols)
 
     turnovers = []
     costs = []
@@ -562,7 +541,7 @@ def ap_pruning_static_optimize(
             curr_stock_w = _month_stock_weights(
                 stock_weights=sw,
                 meta=meta,
-                candidate_weights=candidate_w,
+                candidate_weights=candidate_w_trade,
                 stock_weight_col="tilt_stock_w",
             )
             turnover = _stock_turnover(curr_stock_w, prev_stock_w)
@@ -578,11 +557,17 @@ def ap_pruning_static_optimize(
     result["cost"] = costs
     result["net_ret"] = result["gross_ret"] - result["cost"]
 
-    weights = pd.DataFrame({"candidate": cols, "weight": w})
-    weights = (
-        weights[weights["weight"].abs() > 1e-12]
-        .reset_index(drop=True)
+    weights = pd.DataFrame(
+        {
+            "candidate": cols,
+            "weight_sdf": w_sdf,
+            "weight_trade": w_trade,
+        }
     )
+    weights = weights[
+        (weights["weight_sdf"].abs() > 1e-12)
+        | (weights["weight_trade"].abs() > 1e-12)
+    ].reset_index(drop=True)
 
     diag = pd.DataFrame(
         [
@@ -590,25 +575,29 @@ def ap_pruning_static_optimize(
                 "sample": "cv_train",
                 "start_row": 0,
                 "end_row_exclusive": n_train,
-                "sharpe_monthly": cv_table[(best_i, best_j)]["train_SR"],
+                "sharpe_sdf_monthly": cv_table[(best_i, best_j)]["train_SR_sdf"],
+                "sharpe_trade_monthly": cv_table[(best_i, best_j)]["train_SR_trade"],
             },
             {
                 "sample": "cv_valid",
                 "start_row": n_train,
                 "end_row_exclusive": n_train_valid,
-                "sharpe_monthly": cv_table[(best_i, best_j)]["valid_SR"],
+                "sharpe_sdf_monthly": cv_table[(best_i, best_j)]["valid_SR_sdf"],
+                "sharpe_trade_monthly": cv_table[(best_i, best_j)]["valid_SR_trade"],
             },
             {
                 "sample": "full_train_valid",
                 "start_row": 0,
                 "end_row_exclusive": n_train_valid,
-                "sharpe_monthly": full_first["train_SR"],
+                "sharpe_sdf_monthly": full_first["train_SR_sdf"],
+                "sharpe_trade_monthly": full_first["train_SR_trade"],
             },
             {
                 "sample": "test",
                 "start_row": n_train_valid,
                 "end_row_exclusive": len(df),
-                "sharpe_monthly": _safe_sr(gross),
+                "sharpe_sdf_monthly": _safe_sr(gross_sdf),
+                "sharpe_trade_monthly": _safe_sr(gross_trade),
             },
         ]
     )
@@ -619,9 +608,11 @@ def ap_pruning_static_optimize(
         lambda0=lambda0_best,
         lambda2=lambda2_best,
         portsN=port_n,
-        cv_valid_sr=float(cv_table[(best_i, best_j)]["valid_SR"]),
-        full_train_sr=float(full_first["train_SR"]),
-        full_test_sr=float(_safe_sr(gross)),
+        cv_valid_sr_sdf=float(cv_table[(best_i, best_j)]["valid_SR_sdf"]),
+        full_train_sr_sdf=float(full_first["train_SR_sdf"]),
+        full_test_sr_sdf=float(_safe_sr(gross_sdf)),
+        full_train_sr_trade=float(full_first["train_SR_trade"]),
+        full_test_sr_trade=float(_safe_sr(gross_trade)),
     )
 
     return result.reset_index(drop=True), weights, diag, selection
@@ -629,7 +620,6 @@ def ap_pruning_static_optimize(
 
 # ============================================================
 # TC-aware rolling ablation / extension
-# This is NOT the paper replication.
 # ============================================================
 
 def solve_tc_mean_variance_qp(
@@ -646,14 +636,9 @@ def solve_tc_mean_variance_qp(
 ) -> np.ndarray:
     """
     Ablation objective:
-
         min_w 0.5 w'Σw - eta μ'w + 0.5 λ2 ||w||_2^2 + λtc * turnover
 
-    turnover:
-        portfolio: ||w - w_prev||_1
-        stock:     ||M_t w - W_{t-1}||_1
-
-    This is an extension/ablation, not the R AP-pruning replication.
+    Returned weights are gross-exposure-normalized for stable investable backtests.
     """
     mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -686,22 +671,20 @@ def solve_tc_mean_variance_qp(
             + lambda_tc * tc_penalty(w)
         )
 
+    # For the extension we constrain net budget. Gross exposure is normalized after solve.
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
     if long_only:
         bounds = [(0.0, 1.0) for _ in range(k)]
         x0 = np.clip(w_prev, 0.0, 1.0)
-        if x0.sum() <= 1e-12:
-            x0 = np.ones(k) / k
-        else:
-            x0 = x0 / x0.sum()
     else:
-        bounds = [(-2.0, 2.0) for _ in range(k)]
+        bounds = [(-1.0, 1.0) for _ in range(k)]
         x0 = w_prev.copy()
-        if abs(x0.sum()) <= 1e-12:
-            x0 = np.ones(k) / k
-        else:
-            x0 = x0 / x0.sum()
+
+    if abs(x0.sum()) <= 1e-12:
+        x0 = np.ones(k) / k
+    else:
+        x0 = x0 / x0.sum()
 
     res = minimize(
         obj,
@@ -713,15 +696,11 @@ def solve_tc_mean_variance_qp(
     )
 
     if not res.success:
-        return x0
+        return _normalize_gross_exposure(x0)
 
     w = np.asarray(res.x, dtype=float)
     w[np.abs(w) < 1e-12] = 0.0
-
-    if abs(w.sum()) <= 1e-12:
-        return x0
-
-    return w / w.sum()
+    return _normalize_gross_exposure(w)
 
 
 def rolling_tc_optimize(
@@ -740,15 +719,8 @@ def rolling_tc_optimize(
     """
     Rolling transaction-cost-aware ablation.
 
-    B:
-      turnover_mode="portfolio", stock_weights=None
-
-    C:
-      turnover_mode="stock", stock_weights=stock_weights_dir
-
-    selected_candidates:
-      Usually use the candidates selected by the paper-style AP-pruning step.
-      This keeps the ablation tied to the replicated sparse basis assets.
+    Uses gross-exposure-normalized weights so the cumulative wealth plots are
+    interpretable as investable backtests.
     """
     if turnover_mode not in {"portfolio", "stock"}:
         raise ValueError("turnover_mode must be 'portfolio' or 'stock'.")
@@ -850,7 +822,7 @@ def rolling_tc_optimize(
 
         for c, wi in zip(cols, w):
             if abs(wi) > 1e-12:
-                w_rows.append({**meta, "candidate": c, "weight": wi})
+                w_rows.append({**meta, "candidate": c, "weight_trade": wi})
 
         w_prev = w
 

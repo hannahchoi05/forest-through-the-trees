@@ -202,7 +202,7 @@ def main() -> None:
     subdir = "_".join(chars)
 
     out_dir = OUTPUT_DIR / subdir
-    plot_dir = PLOT_DIR / subdir
+    plot_dir = out_dir / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
 

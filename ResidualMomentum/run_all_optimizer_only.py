@@ -51,7 +51,7 @@ def _load_rf() -> np.ndarray | None:
     rf_raw = pd.read_csv(rf_path, header=None).squeeze().astype(float).to_numpy()
 
     # Detect if already in decimal form (median absolute value << 0.01 means decimal)
-    if float(np.abs(rf_raw).median()) < 0.01:
+    if float(np.median(np.abs(rf_raw))) < 0.01::
         print(
             f"Loaded rf series ({len(rf_raw)} months) — values appear already in "
             "decimal form, using as-is.",

@@ -696,7 +696,7 @@ def solve_tc_mean_variance_qp(
     )
 
     if not res.success:
-        return _normalize_gross_exposure(x0)
+        return w_prev.copy()
 
     w = np.asarray(res.x, dtype=float)
     w[np.abs(w) < 1e-12] = 0.0

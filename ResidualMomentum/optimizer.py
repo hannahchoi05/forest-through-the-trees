@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -325,8 +324,10 @@ def _ap_pruning_run_one(
     - `weights_sdf` is the faithful R-style SDF/path weight:
           b = beta * adj_w
           b = b / abs(sum(b))
+    - `weights_eval_b_div_adjw` is what R uses for SR computation:
+          sdf_ret = ports %*% (b / adj_w)
     - `weights_trade` is the investable plotting/TC version:
-          b_trade = b / sum(abs(b))
+          b_trade = normalize_gross_exposure(b / adj_w)
       This is NOT used to select lambda0/lambda2; it is only used for wealth
       plots and transaction-cost analysis.
     """
@@ -338,6 +339,13 @@ def _ap_pruning_run_one(
     sigma = 0.5 * (sigma + sigma.T)
 
     eigvals, eigvecs = np.linalg.eigh(sigma)
+
+    # R eigen() returns eigenvalues in descending order. Match that ordering
+    # before filtering so the LARS path is as close as possible to the R code.
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
     keep = eigvals > 1e-10
     if keep.sum() == 0:
         return []
@@ -371,13 +379,20 @@ def _ap_pruning_run_one(
 
         b_sdf = b_sdf / denom
 
-        # Investable version for wealth plots / TC.
-        b_trade = _normalize_gross_exposure(b_sdf)
+        # R evaluates SDF returns using b / adj_w:
+        #   sdf_train = as.matrix(ports_train) %*% (b / adj_w)
+        # Since ports_*_raw is the unadjusted candidate-return matrix,
+        # evaluate the faithful SDF payoff with b_eval = b_sdf / adj_w.
+        b_eval = b_sdf / adj_w
+
+        # Investable version for wealth plots / TC. This is not used for
+        # lambda selection; it is only the gross-normalized trading version.
+        b_trade = _normalize_gross_exposure(b_eval)
         if np.sum(np.abs(b_trade)) < 1e-12:
             continue
 
-        train_sdf_ret = ports_train_raw @ b_sdf
-        test_sdf_ret = ports_test_raw @ b_sdf
+        train_sdf_ret = ports_train_raw @ b_eval
+        test_sdf_ret = ports_test_raw @ b_eval
 
         train_trade_ret = ports_train_raw @ b_trade
         test_trade_ret = ports_test_raw @ b_trade
@@ -389,12 +404,13 @@ def _ap_pruning_run_one(
             "test_SR_trade": _safe_sr(test_trade_ret),
             "portsN": int(row["portsN"]),
             "weights_sdf": b_sdf,
+            "weights_eval_b_div_adjw": b_eval,
             "weights_trade": b_trade,
             "step": row["step"],
         }
 
         if ports_valid_raw is not None:
-            valid_sdf_ret = ports_valid_raw @ b_sdf
+            valid_sdf_ret = ports_valid_raw @ b_eval
             valid_trade_ret = ports_valid_raw @ b_trade
             record["valid_SR_sdf"] = _safe_sr(valid_sdf_ret)
             record["valid_SR_trade"] = _safe_sr(valid_trade_ret)
@@ -417,6 +433,7 @@ def ap_pruning_static_optimize(
     cost_per_turnover: float = 0.0,
     stock_weights=None,
     use_stock_level_turnover: bool = False,
+    rf: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, APPruningSelection]:
     """
     Static AP-pruning with two outputs:
@@ -427,6 +444,15 @@ def ap_pruning_static_optimize(
       - exact portsN == port_n
       - validation Sharpe on SDF payoff, not trading-normalized payoff
       - first exact row, no nearest-K fallback
+
+    Parameters
+    ----------
+    rf : np.ndarray or None
+        Monthly risk-free rates in decimal form (e.g. 0.004 for 0.4%).
+        Loaded from rf_factor.csv (stored as percentage points) and divided
+        by 100 before passing here, matching R Step3_RmRf_Combine_Trees.R:
+            port_ret[,i] = port_ret[,i] - rf/100
+        If None, raw returns are used (not excess returns).
     """
     df = returns_df.copy().sort_values(["yy", "mm"]).reset_index(drop=True)
 
@@ -440,6 +466,25 @@ def ap_pruning_static_optimize(
         raise ValueError("n_train_valid must be smaller than number of months.")
 
     raw = df[cols].astype(float).fillna(0.0).to_numpy()
+
+    # Subtract risk-free rate to match R Step3_RmRf_Combine_Trees.R.
+    # R code: port_ret[,i] = port_ret[,i] - (rf)/100
+    # rf is passed in already divided by 100 (decimal form).
+    if rf is not None:
+        rf_arr = np.asarray(rf, dtype=float).flatten()
+        n = len(raw)
+        if len(rf_arr) >= n:
+            rf_arr = rf_arr[:n]
+        else:
+            # Pad with zeros if rf is shorter than data (should not happen)
+            print(
+                f"WARNING: rf series length {len(rf_arr)} < data length {n}. "
+                "Padding with zeros.",
+                flush=True,
+            )
+            rf_arr = np.concatenate([rf_arr, np.zeros(n - len(rf_arr))])
+        raw = raw - rf_arr.reshape(-1, 1)
+
     adj_w = _depth_adjustment(cols)
 
     n_valid = int(n_train_valid / cv_n)
@@ -514,11 +559,13 @@ def ap_pruning_static_optimize(
     full_first = exact_full_rows[0]
 
     w_sdf = np.asarray(full_first["weights_sdf"], dtype=float)
+    w_eval = np.asarray(full_first["weights_eval_b_div_adjw"], dtype=float)
     w_trade = np.asarray(full_first["weights_trade"], dtype=float)
 
     # Backtest/wealth plots use investable gross-normalized weights.
+    # SDF diagnostics use the faithful R-style b / adj_w evaluation weights.
     gross_trade = ports_test @ w_trade
-    gross_sdf = ports_test @ w_sdf
+    gross_sdf = ports_test @ w_eval
 
     result = df.iloc[n_train_valid:][meta_cols].copy()
     result["method"] = method_name
@@ -560,12 +607,14 @@ def ap_pruning_static_optimize(
     weights = pd.DataFrame(
         {
             "candidate": cols,
-            "weight_sdf": w_sdf,
+            "weight_sdf_b": w_sdf,
+            "weight_eval_b_div_adjw": w_eval,
             "weight_trade": w_trade,
         }
     )
     weights = weights[
-        (weights["weight_sdf"].abs() > 1e-12)
+        (weights["weight_sdf_b"].abs() > 1e-12)
+        | (weights["weight_eval_b_div_adjw"].abs() > 1e-12)
         | (weights["weight_trade"].abs() > 1e-12)
     ].reset_index(drop=True)
 
@@ -636,7 +685,7 @@ def solve_tc_mean_variance_qp(
 ) -> np.ndarray:
     """
     Ablation objective:
-        min_w 0.5 w'Σw - eta μ'w + 0.5 λ2 ||w||_2^2 + λtc * turnover
+        min_w 0.5 w'Sigma w - eta mu'w + 0.5 lambda2 ||w||_2^2 + lambda_tc * turnover
 
     Returned weights are gross-exposure-normalized for stable investable backtests.
     """
@@ -696,9 +745,13 @@ def solve_tc_mean_variance_qp(
     )
 
     if not res.success:
-        return w_prev.copy()
+        # Freeze previous portfolio instead of resetting to equal weights.
+        return _normalize_gross_exposure(w_prev)
 
     w = np.asarray(res.x, dtype=float)
+    if np.any(~np.isfinite(w)):
+        return _normalize_gross_exposure(w_prev)
+
     w[np.abs(w) < 1e-12] = 0.0
     return _normalize_gross_exposure(w)
 

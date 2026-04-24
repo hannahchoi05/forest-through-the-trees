@@ -1,17 +1,46 @@
 from __future__ import annotations
+
 import pandas as pd
 
 from config import (
-    CHUNK_DIR, FACTOR_DIR, OUTPUT_DIR, PLOT_DIR,
-    DEFAULT_CHARS, DEFAULT_Y_MIN, DEFAULT_Y_MAX, DEFAULT_TREE_DEPTH, DEFAULT_Q_NUM,
-    DEFAULT_TAU, MOM_LOOKBACK, MOM_SKIP_RECENT, BETA_WINDOW,
-    N_TRAIN_VALID, CV_N, STATIC_LAMBDA_L1, STATIC_LAMBDA_L2, STATIC_MU0, LONG_ONLY,
-    ROLLING_WINDOW, TC_COST, TC_LAMBDA_L1, TC_LAMBDA_L2, TC_LAMBDA_TC, TC_MU0,
+    CHUNK_DIR,
+    FACTOR_DIR,
+    OUTPUT_DIR,
+    PLOT_DIR,
+    DEFAULT_CHARS,
+    DEFAULT_Y_MIN,
+    DEFAULT_Y_MAX,
+    DEFAULT_TREE_DEPTH,
+    DEFAULT_Q_NUM,
+    DEFAULT_TAU,
+    MOM_LOOKBACK,
+    MOM_SKIP_RECENT,
+    BETA_WINDOW,
+    N_TRAIN_VALID,
+    CV_N,
+    STATIC_LAMBDA_L1,
+    STATIC_LAMBDA_L2,
+    STATIC_MU0,
+    LONG_ONLY,
+    ROLLING_WINDOW,
+    TC_COST,
+    TC_LAMBDA_L1,
+    TC_LAMBDA_L2,
+    TC_LAMBDA_TC,
+    TC_MU0,
     DEDUPLICATE_CANDIDATES,
+    RUN_FULL_TREE_SET,
+    USE_STOCK_LEVEL_TURNOVER,
 )
 from data_io import load_yearly_chunks, load_market_proxy
-from residual_momentum import add_raw_momentum_signal, add_market_residual_momentum_signal
-from tree_portfolios import build_all_ap_tree_candidate_returns, select_candidate_matrix
+from residual_momentum import (
+    add_raw_momentum_signal,
+    add_market_residual_momentum_signal,
+)
+from tree_portfolios import (
+    build_all_ap_tree_candidate_returns,
+    select_candidate_matrix,
+)
 from optimizer import static_paper_style_optimize, rolling_tc_optimize
 from metrics import performance_metrics, add_wealth_drawdown
 from plots import make_all_plots
@@ -20,16 +49,18 @@ from plots import make_all_plots
 def main() -> None:
     chars = DEFAULT_CHARS
     subdir = "_".join(chars)
+
     out_dir = OUTPUT_DIR / subdir
     plot_dir = PLOT_DIR / subdir
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading stock-month yearly chunks for {subdir}...")
+    print(f"Loading stock-month yearly chunks for {subdir}...", flush=True)
     panel = load_yearly_chunks(CHUNK_DIR, chars, DEFAULT_Y_MIN, DEFAULT_Y_MAX)
 
-    print("Computing residual momentum signal...")
+    print("Computing residual momentum signal...", flush=True)
     market = load_market_proxy(FACTOR_DIR)
+
     if market is not None:
         panel = add_market_residual_momentum_signal(
             panel,
@@ -46,9 +77,12 @@ def main() -> None:
             skip_recent=MOM_SKIP_RECENT,
         )
         signal_version = "raw_momentum_fallback"
+
     panel.to_csv(out_dir / f"stock_panel_with_{signal_version}.csv", index=False)
 
-    print("Building full AP-tree candidate set with residual momentum tilt...")
+    tree_mode = "full AP-tree set" if RUN_FULL_TREE_SET else "single-tree debug set"
+    print(f"Building {tree_mode} with residual momentum tilt...", flush=True)
+
     candidate_returns, stock_weights, node_stats = build_all_ap_tree_candidate_returns(
         panel=panel,
         chars=chars,
@@ -57,16 +91,25 @@ def main() -> None:
         q_num=DEFAULT_Q_NUM,
         signal_col="residual_mom",
         deduplicate=DEDUPLICATE_CANDIDATES,
+        run_full_tree_set=RUN_FULL_TREE_SET,
     )
-    candidate_returns.to_csv(out_dir / f"candidate_returns_full_ap_tree_tau_{DEFAULT_TAU}.csv", index=False)
-    stock_weights.to_csv(out_dir / f"stock_weights_full_ap_tree_tau_{DEFAULT_TAU}.csv", index=False)
-    node_stats.to_csv(out_dir / f"node_stats_full_ap_tree_tau_{DEFAULT_TAU}.csv", index=False)
 
-    # We compare the two requested methods using the residual-momentum-tilted AP-tree candidates.
+    print(f"Candidate returns shape: {candidate_returns.shape}", flush=True)
+    print(f"Stock weights shape: {stock_weights.shape}", flush=True)
+
+    candidate_returns.to_csv(out_dir / f"candidate_returns_tau_{DEFAULT_TAU}.csv", index=False)
+    stock_weights.to_csv(out_dir / f"stock_weights_tau_{DEFAULT_TAU}.csv", index=False)
+    node_stats.to_csv(out_dir / f"node_stats_tau_{DEFAULT_TAU}.csv", index=False)
+
     tilted_returns = select_candidate_matrix(candidate_returns, prefix="tilt_")
     tilted_returns.to_csv(out_dir / f"tilted_candidate_matrix_tau_{DEFAULT_TAU}.csv", index=False)
 
-    print("Running paper-faithful static optimization: no rolling window, residual momentum tilt...")
+    print(
+        "Running paper-faithful static optimization: "
+        "no rolling window, residual momentum tilt...",
+        flush=True,
+    )
+
     bt_static, static_weights, static_diag = static_paper_style_optimize(
         tilted_returns,
         n_train_valid=N_TRAIN_VALID,
@@ -76,12 +119,27 @@ def main() -> None:
         mu0=STATIC_MU0,
         long_only=LONG_ONLY,
         method_name="Static paper-style optimizer + residual momentum tilt",
+        cost_per_turnover=TC_COST,
+        stock_weights=stock_weights,
+        use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
-    bt_static.to_csv(out_dir / "backtest_static_paper_style_plus_residual_momentum_tilt.csv", index=False)
-    static_weights.to_csv(out_dir / "weights_static_paper_style_plus_residual_momentum_tilt.csv", index=False)
+
+    bt_static.to_csv(
+        out_dir / "backtest_static_paper_style_plus_residual_momentum_tilt.csv",
+        index=False,
+    )
+    static_weights.to_csv(
+        out_dir / "weights_static_paper_style_plus_residual_momentum_tilt.csv",
+        index=False,
+    )
     static_diag.to_csv(out_dir / "diagnostics_static_train_valid_test.csv", index=False)
 
-    print("Running rolling TC-aware optimization: residual momentum tilt + transaction cost penalty...")
+    print(
+        "Running rolling TC-aware optimization: "
+        "residual momentum tilt + transaction cost penalty...",
+        flush=True,
+    )
+
     bt_tc, tc_weights = rolling_tc_optimize(
         tilted_returns,
         window=ROLLING_WINDOW,
@@ -92,12 +150,26 @@ def main() -> None:
         mu0=TC_MU0,
         long_only=LONG_ONLY,
         method_name="Rolling TC-aware optimizer + residual momentum tilt",
+        stock_weights=stock_weights,
+        use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
-    bt_tc.to_csv(out_dir / "backtest_rolling_tc_aware_plus_residual_momentum_tilt.csv", index=False)
-    tc_weights.to_csv(out_dir / "weights_rolling_tc_aware_plus_residual_momentum_tilt.csv", index=False)
+
+    bt_tc.to_csv(
+        out_dir / "backtest_rolling_tc_aware_plus_residual_momentum_tilt.csv",
+        index=False,
+    )
+    tc_weights.to_csv(
+        out_dir / "weights_rolling_tc_aware_plus_residual_momentum_tilt.csv",
+        index=False,
+    )
+
+    common_start = max(bt_static["date_dt"].min(), bt_tc["date_dt"].min())
+    bt_static = bt_static[bt_static["date_dt"] >= common_start].copy()
+    bt_tc = bt_tc[bt_tc["date_dt"] >= common_start].copy()
 
     backtest = pd.concat([bt_static, bt_tc], ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
+
     backtest.to_csv(out_dir / "backtest_comparison.csv", index=False)
 
     enriched = add_wealth_drawdown(backtest)
@@ -105,13 +177,15 @@ def main() -> None:
 
     metrics = performance_metrics(backtest)
     metrics.to_csv(out_dir / "summary_metrics_comparison.csv", index=False)
-    print("\nSummary metrics:")
-    print(metrics.to_string(index=False))
 
-    print("Making plots...")
+    print("\nSummary metrics:", flush=True)
+    print(metrics.to_string(index=False), flush=True)
+
+    print("Making plots...", flush=True)
     make_all_plots(backtest, plot_dir)
-    print(f"Done. Outputs saved to: {out_dir}")
-    print(f"Plots saved to: {plot_dir}")
+
+    print(f"Done. Outputs saved to: {out_dir}", flush=True)
+    print(f"Plots saved to: {plot_dir}", flush=True)
 
 
 if __name__ == "__main__":

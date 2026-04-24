@@ -1,10 +1,6 @@
 # Residual Momentum AP-Tree Ablation
 
-This folder is self-contained and does not edit the original R pipeline.
-
-## What this code compares
-
-It produces exactly the two methods requested:
+The code produces exactly the two methods:
 
 1. **Static paper-style optimizer + residual momentum tilt**
    - Reconstructs the full AP-tree candidate set.
@@ -22,7 +18,7 @@ It produces exactly the two methods requested:
 ## Run
 
 ```bash
-cd "C:\Users\hongv\OneDrive\Tài liệu\forest-through-the-trees\ResidualMomentum"
+cd "ResidualMomentum"
 pip install -r requirements.txt
 python run_all.py
 ```
@@ -58,4 +54,4 @@ Key files:
 - `backtest_rolling_tc_aware_plus_residual_momentum_tilt.csv`
 - `backtest_comparison.csv`
 - `summary_metrics_comparison.csv`
-- Plot A through Plot F PNG files.
+- Plots in PNG files.

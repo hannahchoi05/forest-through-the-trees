@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import pandas as pd
 
 from config import (
@@ -59,6 +60,13 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
 
+    stock_weights_dir = out_dir / f"stock_weights_by_month_tau_{DEFAULT_TAU}"
+
+    if stock_weights_dir.exists():
+        shutil.rmtree(stock_weights_dir)
+
+    stock_weights_dir.mkdir(parents=True, exist_ok=True)
+
     print(f"Loading stock-month yearly chunks for {subdir}...", flush=True)
     panel = load_yearly_chunks(CHUNK_DIR, chars, DEFAULT_Y_MIN, DEFAULT_Y_MAX)
 
@@ -86,8 +94,9 @@ def main() -> None:
 
     tree_mode = "full AP-tree set" if RUN_FULL_TREE_SET else "single-tree debug set"
     print(f"Building {tree_mode} with residual momentum tilt...", flush=True)
+    print(f"Streaming stock weights to: {stock_weights_dir}", flush=True)
 
-    candidate_returns, stock_weights, node_stats = build_all_ap_tree_candidate_returns(
+    candidate_returns, stock_weights_path, node_stats = build_all_ap_tree_candidate_returns(
         panel=panel,
         chars=chars,
         tree_depth=DEFAULT_TREE_DEPTH,
@@ -96,22 +105,18 @@ def main() -> None:
         signal_col="residual_mom",
         deduplicate=DEDUPLICATE_CANDIDATES,
         run_full_tree_set=RUN_FULL_TREE_SET,
+        stock_weights_dir=stock_weights_dir,
     )
 
     print(f"Candidate returns shape: {candidate_returns.shape}", flush=True)
-    print(f"Stock weights shape: {stock_weights.shape}", flush=True)
+    print(f"Stock weights streamed to: {stock_weights_path}", flush=True)
 
     candidate_returns.to_csv(out_dir / f"candidate_returns_tau_{DEFAULT_TAU}.csv", index=False)
-    stock_weights.to_csv(out_dir / f"stock_weights_tau_{DEFAULT_TAU}.csv", index=False)
     node_stats.to_csv(out_dir / f"node_stats_tau_{DEFAULT_TAU}.csv", index=False)
 
     tilted_returns = select_candidate_matrix(candidate_returns, prefix="tilt_")
     tilted_returns.to_csv(out_dir / f"tilted_candidate_matrix_tau_{DEFAULT_TAU}.csv", index=False)
 
-    # ---------------------------------------------------------------------
-    # 1. AP-tree + residual momentum baseline:
-    #    static paper-style optimizer, NO transaction costs.
-    # ---------------------------------------------------------------------
     print(
         "Running AP-tree + RM baseline: "
         "static optimizer, no transaction costs...",
@@ -136,9 +141,6 @@ def main() -> None:
     rm_static_no_tc_weights.to_csv(out_dir / "weights_ap_tree_rm_static_no_tc.csv", index=False)
     rm_static_no_tc_diag.to_csv(out_dir / "diagnostics_ap_tree_rm_static_no_tc.csv", index=False)
 
-    # ---------------------------------------------------------------------
-    # 2. AP-tree + residual momentum with static optimizer and stock-level TC.
-    # ---------------------------------------------------------------------
     print(
         "Running AP-tree + RM static optimizer with stock-level transaction costs...",
         flush=True,
@@ -154,7 +156,7 @@ def main() -> None:
         long_only=LONG_ONLY,
         method_name="AP-tree + RM static + stock-level TC",
         cost_per_turnover=TC_COST,
-        stock_weights=stock_weights,
+        stock_weights=stock_weights_path,
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
@@ -162,9 +164,6 @@ def main() -> None:
     static_weights.to_csv(out_dir / "weights_ap_tree_rm_static_stock_level_tc.csv", index=False)
     static_diag.to_csv(out_dir / "diagnostics_ap_tree_rm_static_stock_level_tc.csv", index=False)
 
-    # ---------------------------------------------------------------------
-    # 3. AP-tree + residual momentum with rolling TC-aware optimizer.
-    # ---------------------------------------------------------------------
     print(
         "Running AP-tree + RM rolling TC-aware optimizer with stock-level transaction costs...",
         flush=True,
@@ -180,16 +179,13 @@ def main() -> None:
         mu0=TC_MU0,
         long_only=LONG_ONLY,
         method_name="AP-tree + RM rolling TC-aware + stock-level TC",
-        stock_weights=stock_weights,
+        stock_weights=stock_weights_path,
         use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
     )
 
     bt_tc.to_csv(out_dir / "backtest_ap_tree_rm_rolling_tc_stock_level_tc.csv", index=False)
     tc_weights.to_csv(out_dir / "weights_ap_tree_rm_rolling_tc_stock_level_tc.csv", index=False)
 
-    # ---------------------------------------------------------------------
-    # Align strategy variants to common calendar sample.
-    # ---------------------------------------------------------------------
     common_start = max(
         bt_rm_static_no_tc["date_dt"].min(),
         bt_static["date_dt"].min(),
@@ -217,9 +213,6 @@ def main() -> None:
         & (bt_tc["date_dt"] <= common_end)
     ].copy()
 
-    # ---------------------------------------------------------------------
-    # 4. Add S&P 500 benchmark using SPY adjusted close from Yahoo Finance.
-    # ---------------------------------------------------------------------
     print("Loading S&P 500 benchmark from Yahoo Finance using SPY...", flush=True)
 
     try:
@@ -230,7 +223,6 @@ def main() -> None:
             method_name="S&P 500 (SPY adjusted close)",
         )
 
-        # Keep only dates shared with the strategy backtest.
         strategy_dates = pd.concat(
             [
                 bt_rm_static_no_tc[["date_dt"]],
@@ -248,9 +240,6 @@ def main() -> None:
         print(f"WARNING: Could not load SPY benchmark from Yahoo Finance: {e}", flush=True)
         bt_spy = pd.DataFrame()
 
-    # ---------------------------------------------------------------------
-    # Combine and evaluate.
-    # ---------------------------------------------------------------------
     pieces = [bt_rm_static_no_tc, bt_static, bt_tc]
 
     if not bt_spy.empty:

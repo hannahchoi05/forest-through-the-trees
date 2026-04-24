@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -22,23 +23,47 @@ def _candidate_to_node_id(candidate: str) -> str:
     return candidate
 
 
-def _prep_stock_weights(stock_weights: pd.DataFrame | None) -> pd.DataFrame | None:
-    if stock_weights is None or stock_weights.empty:
+def _prep_stock_weights(stock_weights):
+    """
+    stock_weights can be:
+      - None
+      - in-memory DataFrame
+      - Path to monthly Parquet directory
+    """
+    if stock_weights is None:
         return None
 
-    sw = stock_weights.copy()
+    if isinstance(stock_weights, (str, Path)):
+        return Path(stock_weights)
 
-    if "date_dt" in sw.columns:
-        sw["date_dt"] = pd.to_datetime(sw["date_dt"])
+    if isinstance(stock_weights, pd.DataFrame):
+        if stock_weights.empty:
+            return None
 
-    sw["node_id"] = sw["node_id"].astype(str)
-    sw["permno"] = sw["permno"].astype(str)
+        sw = stock_weights.copy()
 
-    return sw
+        if "date_dt" in sw.columns:
+            sw["date_dt"] = pd.to_datetime(sw["date_dt"])
+
+        sw["node_id"] = sw["node_id"].astype(str)
+        sw["permno"] = sw["permno"].astype(str)
+
+        return sw
+
+    raise TypeError(f"Unsupported stock_weights type: {type(stock_weights)}")
+
+
+def _load_month_stock_weights_from_dir(stock_weights_dir: Path, meta: dict) -> pd.DataFrame:
+    file_path = stock_weights_dir / f"{int(meta['yy'])}_{int(meta['mm']):02d}.parquet"
+
+    if not file_path.exists():
+        return pd.DataFrame()
+
+    return pd.read_parquet(file_path)
 
 
 def _month_stock_weights(
-    stock_weights: pd.DataFrame | None,
+    stock_weights,
     meta: dict,
     candidate_weights: pd.Series,
     stock_weight_col: str = "tilt_stock_w",
@@ -49,21 +74,24 @@ def _month_stock_weights(
     final_stock_weight_i,t =
         sum_p optimizer_weight_p,t * stock_weight_i,p,t
     """
-    if stock_weights is None or stock_weights.empty:
+    if stock_weights is None:
         return pd.Series(dtype=float)
 
-    sw = stock_weights
-
-    if "date_dt" in sw.columns and "date_dt" in meta:
-        date_val = pd.to_datetime(meta["date_dt"])
-        m = sw[sw["date_dt"].eq(date_val)].copy()
-    elif "yy" in sw.columns and "mm" in sw.columns:
-        m = sw[
-            (sw["yy"].astype(int).eq(int(meta["yy"])))
-            & (sw["mm"].astype(int).eq(int(meta["mm"])))
-        ].copy()
+    if isinstance(stock_weights, Path):
+        m = _load_month_stock_weights_from_dir(stock_weights, meta)
     else:
-        raise ValueError("stock_weights must contain date_dt or yy/mm columns.")
+        sw = stock_weights
+
+        if "date_dt" in sw.columns and "date_dt" in meta:
+            date_val = pd.to_datetime(meta["date_dt"])
+            m = sw[sw["date_dt"].eq(date_val)].copy()
+        elif "yy" in sw.columns and "mm" in sw.columns:
+            m = sw[
+                (sw["yy"].astype(int).eq(int(meta["yy"])))
+                & (sw["mm"].astype(int).eq(int(meta["mm"])))
+            ].copy()
+        else:
+            raise ValueError("stock_weights must contain date_dt or yy/mm columns.")
 
     if m.empty:
         return pd.Series(dtype=float)
@@ -78,6 +106,9 @@ def _month_stock_weights(
     wmap = cw.rename("optimizer_w").reset_index()
     wmap = wmap.rename(columns={"index": "node_id"})
     wmap["node_id"] = wmap["node_id"].astype(str)
+
+    m["node_id"] = m["node_id"].astype(str)
+    m["permno"] = m["permno"].astype(str)
 
     m = m.merge(wmap, on="node_id", how="inner")
 
@@ -187,7 +218,7 @@ def static_paper_style_optimize(
     long_only: bool = True,
     method_name: str = "Static paper-style + residual momentum tilt",
     cost_per_turnover: float = 0.0025,
-    stock_weights: pd.DataFrame | None = None,
+    stock_weights=None,
     use_stock_level_turnover: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = returns_df.copy().sort_values(["yy", "mm"]).reset_index(drop=True)
@@ -228,7 +259,6 @@ def static_paper_style_optimize(
 
     turnovers = []
     costs = []
-    stock_weight_rows = []
     prev_stock_w = None
 
     for _, row in result.iterrows():
@@ -242,13 +272,9 @@ def static_paper_style_optimize(
                 stock_weight_col="tilt_stock_w",
             )
             turnover = _stock_turnover(curr_stock_w, prev_stock_w)
-
-            for permno, wi in curr_stock_w.items():
-                stock_weight_rows.append({**meta, "permno": permno, "stock_weight": wi})
-
             prev_stock_w = curr_stock_w
         else:
-            turnover = STATIC_TURNOVER_PROXY
+            turnover = 0.0 if cost_per_turnover == 0.0 else STATIC_TURNOVER_PROXY
 
         turnovers.append(turnover)
         costs.append(turnover * cost_per_turnover)
@@ -305,7 +331,7 @@ def rolling_tc_optimize(
     mu0: float | None = None,
     long_only: bool = True,
     method_name: str = "Rolling TC-aware + residual momentum tilt",
-    stock_weights: pd.DataFrame | None = None,
+    stock_weights=None,
     use_stock_level_turnover: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = returns_df.copy().sort_values(["yy", "mm"]).reset_index(drop=True)
@@ -319,7 +345,6 @@ def rolling_tc_optimize(
 
     rows = []
     w_rows = []
-    stock_weight_rows = []
 
     sw = _prep_stock_weights(stock_weights)
     meta_cols = _meta_cols(df)
@@ -355,10 +380,6 @@ def rolling_tc_optimize(
                 stock_weight_col="tilt_stock_w",
             )
             turnover = _stock_turnover(curr_stock_w, prev_stock_w)
-
-            for permno, wi in curr_stock_w.items():
-                stock_weight_rows.append({**meta, "permno": permno, "stock_weight": wi})
-
             prev_stock_w = curr_stock_w
         else:
             turnover = raw_turnover
@@ -384,14 +405,4 @@ def rolling_tc_optimize(
 
         w_prev = w
 
-    weights = pd.DataFrame(w_rows)
-
-    if stock_weight_rows:
-        final_stock_weights = pd.DataFrame(stock_weight_rows)
-        weights = pd.concat(
-            [weights, final_stock_weights.assign(candidate="__FINAL_STOCK_WEIGHT__")],
-            ignore_index=True,
-            sort=False,
-        )
-
-    return pd.DataFrame(rows), weights
+    return pd.DataFrame(rows), pd.DataFrame(w_rows)

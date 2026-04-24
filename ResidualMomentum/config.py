@@ -51,7 +51,9 @@ TC_LAMBDA_TC = 0.0025
 TC_MU0 = None
 
 DEDUPLICATE_CANDIDATES = True
-RUN_FULL_TREE_SET = False
+RUN_FULL_TREE_SET = True
 
-# New: use actual underlying stock-weight turnover instead of portfolio-weight proxy.
 USE_STOCK_LEVEL_TURNOVER = True
+
+# New: avoid holding all stock weights in RAM.
+STREAM_STOCK_WEIGHTS = True

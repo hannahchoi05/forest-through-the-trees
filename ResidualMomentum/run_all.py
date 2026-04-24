@@ -1,8 +1,6 @@
-
 from __future__ import annotations
 
 import shutil
-
 import pandas as pd
 
 from config import (
@@ -34,7 +32,7 @@ from config import (
     AP_K_MAX,
     AP_PORT_N,
     TC_ETA,
-    TC_LONG_ONLY
+    TC_LONG_ONLY,
 )
 from data_io import (
     load_yearly_chunks,
@@ -71,14 +69,16 @@ def _align_to_common_window(dfs: list[pd.DataFrame]) -> list[pd.DataFrame]:
     return out
 
 
-def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_path, out_dir, plot_dir) -> None:
+def _run_optimization_and_backtests(
+    tilted_returns: pd.DataFrame,
+    stock_weights_path,
+    out_dir,
+    plot_dir,
+) -> None:
     if "date_dt" in tilted_returns.columns:
         tilted_returns["date_dt"] = pd.to_datetime(tilted_returns["date_dt"])
 
-    # ============================================================
-    # A1: Faithful AP-pruning static, no TC
-    # ============================================================
-    print("\\n[A1] Faithful AP-pruning static, no TC...", flush=True)
+    print("\n[A1] AP-pruning static, no TC...", flush=True)
     bt_a1, w_a1, diag_a1, sel = ap_pruning_static_optimize(
         tilted_returns,
         n_train_valid=N_TRAIN_VALID,
@@ -101,10 +101,7 @@ def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_
 
     selected_candidates = w_a1["candidate"].tolist()
 
-    # ============================================================
-    # A2: Same AP-pruning static weights, stock-level TC ex-post
-    # ============================================================
-    print("\\n[A2] Same AP-pruning static weights, stock-level TC ex-post...", flush=True)
+    print("\n[A2] Same AP-pruning selection, stock-level TC ex-post...", flush=True)
     bt_a2, w_a2, diag_a2, _ = ap_pruning_static_optimize(
         tilted_returns,
         n_train_valid=N_TRAIN_VALID,
@@ -124,10 +121,7 @@ def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_
     w_a2.to_csv(out_dir / "weights_A2_ap_pruning_static_stock_level_tc.csv", index=False)
     diag_a2.to_csv(out_dir / "diagnostics_A2_ap_pruning_static_stock_level_tc.csv", index=False)
 
-    # ============================================================
-    # B: TC-aware rolling ablation, portfolio-level turnover
-    # ============================================================
-    print("\\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
+    print("\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
     bt_b, w_b = rolling_tc_optimize(
         tilted_returns,
         window=ROLLING_WINDOW,
@@ -145,10 +139,7 @@ def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_
     bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
     w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
 
-    # ============================================================
-    # C: TC-aware rolling ablation, stock-level turnover
-    # ============================================================
-    print("\\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
+    print("\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
     bt_c, w_c = rolling_tc_optimize(
         tilted_returns,
         window=ROLLING_WINDOW,
@@ -170,11 +161,11 @@ def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_
 
     pieces = [bt_a1, bt_a2, bt_b, bt_c]
 
-    # Optional SPY benchmark
     try:
-        print("\\nLoading S&P 500 benchmark from Yahoo Finance using SPY...", flush=True)
+        print("\nLoading S&P 500 benchmark from Yahoo Finance using SPY...", flush=True)
         common_start = bt_a1["date_dt"].min()
         common_end = bt_a1["date_dt"].max()
+
         bt_spy = load_yahoo_monthly_benchmark(
             ticker="SPY",
             start_date=common_start,
@@ -196,13 +187,13 @@ def _run_optimization_and_backtests(tilted_returns: pd.DataFrame, stock_weights_
     metrics = performance_metrics(backtest)
     metrics.to_csv(out_dir / "summary_metrics_comparison.csv", index=False)
 
-    print("\\nSummary metrics:", flush=True)
+    print("\nSummary metrics:", flush=True)
     print(metrics.to_string(index=False), flush=True)
 
-    print("\\nMaking plots...", flush=True)
+    print("\nMaking plots...", flush=True)
     make_all_plots(backtest, plot_dir)
 
-    print(f"\\nDone. Outputs saved to: {out_dir}", flush=True)
+    print(f"\nDone. Outputs saved to: {out_dir}", flush=True)
     print(f"Plots saved to: {plot_dir}", flush=True)
 
 

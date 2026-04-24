@@ -10,7 +10,7 @@ if DATA_DIR_ENV:
 else:
     DATA_DIR = REPO_ROOT / "Data"
 
-APTREES_DIR = REPO_ROOT / "APTrees"
+APTREES_DIR = REPO_ROOT / "ap-trees"
 CHUNK_DIR = DATA_DIR / "data_chunk_files_quantile"
 FACTOR_DIR = DATA_DIR / "factor"
 OUTPUT_DIR = APTREES_DIR / "outputs"

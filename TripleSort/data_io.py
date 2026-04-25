@@ -78,7 +78,7 @@ def load_yahoo_monthly_benchmark(
     ticker: str,
     start_date,
     end_date,
-    method_name: str = "S&P 500 (SPY adjusted close)",
+    method_name: str = "S&P 500 (adjusted close)",
 ) -> pd.DataFrame:
     """
     Load a monthly benchmark from Yahoo Finance using adjusted close.

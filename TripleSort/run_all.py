@@ -30,7 +30,6 @@ from config import (  # noqa: E402
     TC_LAMBDA_TC,
     TC_ETA,
     TC_LONG_ONLY,
-    FACTOR_DIR,
     OUTPUT_DIR,
     TS32_DIR,
 )
@@ -39,7 +38,6 @@ from data_io import (  # noqa: E402
     load_triplesort_excess_returns,
     load_yearly_chunks,
     load_yahoo_monthly_benchmark,
-    load_sp500_proxy,
 )
 from optimizer import static_paper_style_optimize, rolling_tc_optimize  # noqa: E402
 from metrics import performance_metrics, add_wealth_drawdown  # noqa: E402
@@ -49,7 +47,9 @@ def main() -> None:
     chars = DEFAULT_CHARS
     subdir = "_".join(chars)
     out_dir = OUTPUT_DIR / subdir
+    plot_dir = out_dir / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
 
     print("Checking triple-sort portfolio parity vs Data/ ...", flush=True)
     check_all()
@@ -79,9 +79,8 @@ def main() -> None:
         use_stock_level_turnover=False,
     )
 
-    bt_a1.to_csv(out_dir / "backtest_triplesort_static_no_tc.csv", index=False)
-    w_a1.to_csv(out_dir / "weights_triplesort_static_no_tc.csv", index=False)
-    diag_a1.to_csv(out_dir / "diagnostics_triplesort_static_no_tc.csv", index=False)
+    # Legacy outputs (backtest_triplesort_* / diagnostics_triplesort_* / weights_triplesort_*)
+    # are no longer emitted; keep only canonical A1/A2/B/C + comparison outputs.
 
     # ---------------------------------------------------------------------
     # A2: Static optimizer with stock-level transaction costs.
@@ -101,9 +100,7 @@ def main() -> None:
         use_stock_level_turnover=True,
     )
 
-    bt_a2.to_csv(out_dir / "backtest_triplesort_static_stock_level_tc.csv", index=False)
-    w_a2.to_csv(out_dir / "weights_triplesort_static_stock_level_tc.csv", index=False)
-    diag_a2.to_csv(out_dir / "diagnostics_triplesort_static_stock_level_tc.csv", index=False)
+    # (weights are not emitted by default to avoid clutter)
 
     # ---------------------------------------------------------------------
     # B: Rolling TC-aware optimizer with portfolio-level turnover costs.
@@ -123,8 +120,7 @@ def main() -> None:
         turnover_mode="portfolio",
     )
 
-    bt_b.to_csv(out_dir / "backtest_triplesort_rolling_tc_port_level.csv", index=False)
-    w_b.to_csv(out_dir / "weights_triplesort_rolling_tc_port_level.csv", index=False)
+    # (rolling weights not emitted by default)
 
     # ---------------------------------------------------------------------
     # C: Rolling TC-aware optimizer with stock-level turnover costs.
@@ -144,8 +140,7 @@ def main() -> None:
         turnover_mode="stock",
     )
 
-    bt_c.to_csv(out_dir / "backtest_triplesort_rolling_tc_stock_level.csv", index=False)
-    w_c.to_csv(out_dir / "weights_triplesort_rolling_tc_stock_level.csv", index=False)
+    # (rolling weights not emitted by default)
 
     # ---------------------------------------------------------------------
     # Write residual_momentum-style filenames (A1/A2/B/C).
@@ -182,25 +177,16 @@ def main() -> None:
 
     pieces = [bt_a1, bt_a2, bt_b, bt_c]
 
-    # Add S&P 500 benchmark (prefer Yahoo SPY adjusted close; fall back to factor proxy).
-    try:
-        bt_sp = load_yahoo_monthly_benchmark(
-            ticker="SPY",
-            start_date=common_start,
-            end_date=common_end,
-            method_name="S&P 500 (SPY adjusted close)",
-        )
-        pieces.append(bt_sp)
-    except Exception as e:
-        print(f"WARNING: Could not load Yahoo SPY benchmark: {e}", flush=True)
-        try:
-            bt_sp = load_sp500_proxy(FACTOR_DIR, method_name="S&P 500 (Mkt-RF + rf proxy)")
-            bt_sp = bt_sp[
-                (bt_sp["date_dt"] >= common_start) & (bt_sp["date_dt"] <= common_end)
-            ].copy()
-            pieces.append(bt_sp)
-        except Exception as e2:
-            print(f"WARNING: Could not load S&P 500 proxy benchmark: {e2}", flush=True)
+    # Add S&P 500 benchmark from Yahoo Finance (adjusted close).
+    # We intentionally do not fall back to the factor proxy here.
+    bt_sp = load_yahoo_monthly_benchmark(
+        ticker="SPY",
+        start_date=common_start,
+        end_date=common_end,
+        method_name="S&P 500 (adjusted close)",
+    )
+    bt_sp = bt_sp[bt_sp["date_dt"].isin(bt_a1["date_dt"])].copy()
+    pieces.append(bt_sp)
 
     backtest = pd.concat(pieces, ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
@@ -240,6 +226,7 @@ def main() -> None:
     print("\nSummary metrics:", flush=True)
     print(metrics.to_string(index=False), flush=True)
     print(f"\nDone. Outputs saved to: {out_dir}", flush=True)
+    print("Generate plots from existing CSVs with: python3 TripleSort/run_plots.py", flush=True)
 
 
 if __name__ == "__main__":

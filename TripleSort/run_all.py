@@ -32,7 +32,6 @@ from config import (  # noqa: E402
     TC_LONG_ONLY,
     OUTPUT_DIR,
     TS32_DIR,
-    TS64_DIR,
 )
 from check_portfolios import check_all  # noqa: E402
 from data_io import (  # noqa: E402
@@ -55,8 +54,8 @@ def main() -> None:
     print("Checking triple-sort portfolio parity vs Data/ ...", flush=True)
     check_all()
 
-    print(f"Loading triple-sort candidate returns (TS64) for {subdir}...", flush=True)
-    portfolio_csv = TS64_DIR / subdir / "excess_ports.csv"
+    print(f"Loading triple-sort candidate returns (TS32) for {subdir}...", flush=True)
+    portfolio_csv = TS32_DIR / subdir / "excess_ports.csv"
     returns = load_triplesort_excess_returns(portfolio_csv)
 
     print("Loading stock-month panel for stock-level turnover...", flush=True)
@@ -179,15 +178,18 @@ def main() -> None:
     pieces = [bt_a1, bt_a2, bt_b, bt_c]
 
     # Add S&P 500 benchmark from Yahoo Finance (adjusted close).
-    # We intentionally do not fall back to the factor proxy here.
-    bt_sp = load_yahoo_monthly_benchmark(
-        ticker="SPY",
-        start_date=common_start,
-        end_date=common_end,
-        method_name="S&P 500 (adjusted close)",
-    )
-    bt_sp = bt_sp[bt_sp["date_dt"].isin(bt_a1["date_dt"])].copy()
-    pieces.append(bt_sp)
+    # No proxy fallback; if Yahoo fails, continue without the benchmark (residual_momentum behavior).
+    try:
+        bt_sp = load_yahoo_monthly_benchmark(
+            ticker="SPY",
+            start_date=common_start,
+            end_date=common_end,
+            method_name="S&P 500 (adjusted close)",
+        )
+        bt_sp = bt_sp[bt_sp["date_dt"].isin(bt_a1["date_dt"])].copy()
+        pieces.append(bt_sp)
+    except Exception as e:
+        print(f"WARNING: Could not load SPY benchmark: {e}", flush=True)
 
     backtest = pd.concat(pieces, ignore_index=True)
     backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)

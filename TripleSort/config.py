@@ -26,7 +26,8 @@ DEFAULT_Y_MIN = 1964
 DEFAULT_Y_MAX = 2016
 
 # Triple-sort bucket specs: TS32 = (2,4,4), TS64 = (4,4,4).
-DEFAULT_N_BINS = (2, 4, 4)
+# Default to TS64.
+DEFAULT_N_BINS = (4, 4, 4)
 
 # Optimizer / backtest parameters (Model_Versions.pdf)
 N_TRAIN_VALID = 360

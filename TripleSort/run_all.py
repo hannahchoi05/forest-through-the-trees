@@ -32,6 +32,7 @@ from config import (  # noqa: E402
     TC_LONG_ONLY,
     OUTPUT_DIR,
     TS32_DIR,
+    TS64_DIR,
 )
 from check_portfolios import check_all  # noqa: E402
 from data_io import (  # noqa: E402
@@ -54,8 +55,8 @@ def main() -> None:
     print("Checking triple-sort portfolio parity vs Data/ ...", flush=True)
     check_all()
 
-    print(f"Loading triple-sort candidate returns for {subdir}...", flush=True)
-    portfolio_csv = TS32_DIR / subdir / "excess_ports.csv"
+    print(f"Loading triple-sort candidate returns (TS64) for {subdir}...", flush=True)
+    portfolio_csv = TS64_DIR / subdir / "excess_ports.csv"
     returns = load_triplesort_excess_returns(portfolio_csv)
 
     print("Loading stock-month panel for stock-level turnover...", flush=True)

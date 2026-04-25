@@ -227,10 +227,6 @@ def _final_stock_weights_for_month(
     out = df.groupby(permno_col)["final_w"].sum()
     out = out[out.abs() > 1e-14]
 
-    total = float(out.sum())
-    if abs(total) > 1e-12:
-        out = out / total
-
     return out
 
 
@@ -273,14 +269,19 @@ def _stock_weight_matrix_for_month(
     sum_size = df.groupby("bucket_id")[size_col].transform("sum")
     df["base_w"] = df[size_col] / sum_size
 
-    permnos = pd.Index(df[permno_col].astype(str).tolist())
     n_ports = n_bins[0] * n_bins[1] * n_bins[2]
-    M = np.zeros((len(df), n_ports), dtype=float)
+    permnos = pd.Index(sorted(df[permno_col].astype(str).unique()))
+    perm_to_row = {p: i for i, p in enumerate(permnos)}
+    M = np.zeros((len(permnos), n_ports), dtype=float)
 
     # bucket_id is 1..n_ports; map to 0-indexed column.
     cols = (df["bucket_id"].to_numpy(dtype=int) - 1).clip(0, n_ports - 1)
-    rows = np.arange(len(df), dtype=int)
-    M[rows, cols] = df["base_w"].to_numpy(dtype=float)
+    for permno, col, base_w in zip(
+        df[permno_col].astype(str).to_numpy(),
+        cols,
+        df["base_w"].to_numpy(dtype=float),
+    ):
+        M[perm_to_row[permno], int(col)] += float(base_w)
 
     return M, permnos
 

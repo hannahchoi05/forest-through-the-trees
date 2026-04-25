@@ -145,8 +145,8 @@ def main() -> None:
         long_only=LONG_ONLY,
         method_name=METHOD_A1,
         cost_per_turnover=0.0,
-        stock_weights=None,
-        use_stock_level_turnover=False,
+        stock_weights=stock_weights_dir,
+        use_stock_level_turnover=True,
     )
     bt_a1.to_csv(out_dir / "backtest_A1_static_no_tc.csv", index=False)
     w_a1.to_csv(out_dir / "weights_A1_static_no_tc.csv", index=False)

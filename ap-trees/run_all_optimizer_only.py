@@ -121,101 +121,130 @@ def main() -> None:
 
     # ============================================================
     # A1: AP-pruning static, no TC
+    # (delete backtest_A1_ap_pruning_static_no_tc.csv to force re-run)
     # ============================================================
-    print("\n[A1] AP-pruning static, no TC...", flush=True)
+    a1_path = out_dir / "backtest_A1_ap_pruning_static_no_tc.csv"
+    w_a1_path = out_dir / "weights_A1_ap_pruning_static_no_tc.csv"
 
-    bt_a1, w_a1, diag_a1, sel = ap_pruning_static_optimize(
-        tilted_returns,
-        n_train_valid=N_TRAIN_VALID,
-        cv_n=CV_N,
-        lambda0_grid=AP_LAMBDA0_GRID,
-        lambda2_grid=AP_LAMBDA2_GRID,
-        port_n=AP_PORT_N,
-        kmin=AP_K_MIN,
-        kmax=AP_K_MAX,
-        method_name="AP-tree + RM AP-pruning (static, no TC)",
-        cost_per_turnover=0.0,
-        stock_weights=None,
-        use_stock_level_turnover=False,
-        rf=rf_series,
-    )
-
-    print(f"Selected AP-pruning params: {sel}", flush=True)
-
-    bt_a1.to_csv(out_dir / "backtest_A1_ap_pruning_static_no_tc.csv", index=False)
-    w_a1.to_csv(out_dir / "weights_A1_ap_pruning_static_no_tc.csv", index=False)
-    diag_a1.to_csv(out_dir / "diagnostics_A1_ap_pruning_static_no_tc.csv", index=False)
+    if a1_path.exists() and w_a1_path.exists():
+        print("\n[A1] Loading from checkpoint (delete backtest_A1_ap_pruning_static_no_tc.csv to re-run)...", flush=True)
+        bt_a1 = pd.read_csv(a1_path)
+        bt_a1["date_dt"] = pd.to_datetime(bt_a1["date_dt"])
+        w_a1 = pd.read_csv(w_a1_path)
+        sel = None  # not needed downstream
+    else:
+        print("\n[A1] AP-pruning static, no TC...", flush=True)
+        bt_a1, w_a1, diag_a1, sel = ap_pruning_static_optimize(
+            tilted_returns,
+            n_train_valid=N_TRAIN_VALID,
+            cv_n=CV_N,
+            lambda0_grid=AP_LAMBDA0_GRID,
+            lambda2_grid=AP_LAMBDA2_GRID,
+            port_n=AP_PORT_N,
+            kmin=AP_K_MIN,
+            kmax=AP_K_MAX,
+            method_name="AP-Trees AP-pruning (static, no TC)",
+            cost_per_turnover=0.0,
+            stock_weights=stock_weights_path,
+            use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
+            rf=rf_series,
+        )
+        print(f"Selected AP-pruning params: {sel}", flush=True)
+        bt_a1.to_csv(a1_path, index=False)
+        w_a1.to_csv(w_a1_path, index=False)
+        diag_a1.to_csv(out_dir / "diagnostics_A1_ap_pruning_static_no_tc.csv", index=False)
 
     selected_candidates = w_a1["candidate"].tolist()
 
     # ============================================================
     # A2: same AP-pruning selection, stock-level TC ex-post
+    # (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to force re-run)
     # ============================================================
-    print("\n[A2] Same AP-pruning selection, stock-level TC ex-post...", flush=True)
+    a2_path = out_dir / "backtest_A2_ap_pruning_static_stock_level_tc.csv"
 
-    bt_a2, w_a2, diag_a2, _ = ap_pruning_static_optimize(
-        tilted_returns,
-        n_train_valid=N_TRAIN_VALID,
-        cv_n=CV_N,
-        lambda0_grid=[sel.lambda0],
-        lambda2_grid=[sel.lambda2],
-        port_n=AP_PORT_N,
-        kmin=AP_K_MIN,
-        kmax=AP_K_MAX,
-        method_name="AP-tree + RM AP-pruning (static + stock-level TC)",
-        cost_per_turnover=TC_COST,
-        stock_weights=stock_weights_path,
-        use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
-        rf=rf_series,
-    )
-
-    bt_a2.to_csv(out_dir / "backtest_A2_ap_pruning_static_stock_level_tc.csv", index=False)
-    w_a2.to_csv(out_dir / "weights_A2_ap_pruning_static_stock_level_tc.csv", index=False)
-    diag_a2.to_csv(out_dir / "diagnostics_A2_ap_pruning_static_stock_level_tc.csv", index=False)
+    if a2_path.exists():
+        print("\n[A2] Loading from checkpoint (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to re-run)...", flush=True)
+        bt_a2 = pd.read_csv(a2_path)
+        bt_a2["date_dt"] = pd.to_datetime(bt_a2["date_dt"])
+    else:
+        print("\n[A2] Same AP-pruning selection, stock-level TC ex-post...", flush=True)
+        # Use full grid if sel is None (A1 was loaded from checkpoint)
+        l0_grid = [sel.lambda0] if sel is not None else AP_LAMBDA0_GRID
+        l2_grid = [sel.lambda2] if sel is not None else AP_LAMBDA2_GRID
+        bt_a2, w_a2, diag_a2, _ = ap_pruning_static_optimize(
+            tilted_returns,
+            n_train_valid=N_TRAIN_VALID,
+            cv_n=CV_N,
+            lambda0_grid=l0_grid,
+            lambda2_grid=l2_grid,
+            port_n=AP_PORT_N,
+            kmin=AP_K_MIN,
+            kmax=AP_K_MAX,
+            method_name="AP-Trees AP-pruning (static + stock-level TC)",
+            cost_per_turnover=TC_COST,
+            stock_weights=stock_weights_path,
+            use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
+            rf=rf_series,
+        )
+        bt_a2.to_csv(a2_path, index=False)
+        w_a2.to_csv(out_dir / "weights_A2_ap_pruning_static_stock_level_tc.csv", index=False)
+        diag_a2.to_csv(out_dir / "diagnostics_A2_ap_pruning_static_stock_level_tc.csv", index=False)
 
     # ============================================================
     # B: rolling TC-aware, portfolio-level turnover
+    # (delete backtest_B_rolling_tc_portfolio_level_tc.csv to force re-run)
     # ============================================================
-    print("\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
+    b_path = out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv"
 
-    bt_b, w_b = rolling_tc_optimize(
-        tilted_returns,
-        window=ROLLING_WINDOW,
-        lambda_l2=TC_LAMBDA_L2,
-        lambda_tc=TC_LAMBDA_TC,
-        eta=TC_ETA,
-        cost_per_turnover=TC_COST,
-        method_name="AP-tree + RM rolling TC-aware (portfolio-level TC)",
-        turnover_mode="portfolio",
-        stock_weights=None,
-        selected_candidates=selected_candidates,
-        long_only=TC_LONG_ONLY,
-    )
-
-    bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
-    w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
+    if b_path.exists():
+        print("\n[B] Loading from checkpoint (delete backtest_B_rolling_tc_portfolio_level_tc.csv to re-run)...", flush=True)
+        bt_b = pd.read_csv(b_path)
+        bt_b["date_dt"] = pd.to_datetime(bt_b["date_dt"])
+    else:
+        print("\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
+        bt_b, w_b = rolling_tc_optimize(
+            tilted_returns,
+            window=ROLLING_WINDOW,
+            lambda_l2=TC_LAMBDA_L2,
+            lambda_tc=TC_LAMBDA_TC,
+            eta=TC_ETA,
+            cost_per_turnover=TC_COST,
+            method_name="AP-Trees rolling TC-aware (portfolio-level TC)",
+            turnover_mode="portfolio",
+            stock_weights=None,
+            selected_candidates=selected_candidates,
+            long_only=TC_LONG_ONLY,
+        )
+        bt_b.to_csv(b_path, index=False)
+        w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
 
     # ============================================================
     # C: rolling TC-aware, stock-level turnover
+    # (delete backtest_C_rolling_tc_stock_level_tc.csv to force re-run)
     # ============================================================
-    print("\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
+    c_path = out_dir / "backtest_C_rolling_tc_stock_level_tc.csv"
 
-    bt_c, w_c = rolling_tc_optimize(
-        tilted_returns,
-        window=ROLLING_WINDOW,
-        lambda_l2=TC_LAMBDA_L2,
-        lambda_tc=TC_LAMBDA_TC,
-        eta=TC_ETA,
-        cost_per_turnover=TC_COST,
-        method_name="AP-tree + RM rolling TC-aware (stock-level TC)",
-        turnover_mode="stock",
-        stock_weights=stock_weights_path,
-        selected_candidates=selected_candidates,
-        long_only=TC_LONG_ONLY,
-    )
-
-    bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv", index=False)
-    w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)
+    if c_path.exists():
+        print("\n[C] Loading from checkpoint (delete backtest_C_rolling_tc_stock_level_tc.csv to re-run)...", flush=True)
+        bt_c = pd.read_csv(c_path)
+        bt_c["date_dt"] = pd.to_datetime(bt_c["date_dt"])
+    else:
+        print("\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
+        bt_c, w_c = rolling_tc_optimize(
+            tilted_returns,
+            window=ROLLING_WINDOW,
+            lambda_l2=TC_LAMBDA_L2,
+            lambda_tc=TC_LAMBDA_TC,
+            eta=TC_ETA,
+            cost_per_turnover=TC_COST,
+            method_name="AP-Trees rolling TC-aware (stock-level TC)",
+            turnover_mode="stock",
+            stock_weights=stock_weights_path,
+            selected_candidates=selected_candidates,
+            long_only=TC_LONG_ONLY,
+        )
+        bt_c.to_csv(c_path, index=False)
+        w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)
 
     # ============================================================
     # Align dates + benchmark + combined outputs

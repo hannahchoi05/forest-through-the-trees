@@ -162,15 +162,21 @@ def _ap_prune(
     mu_bar = float(mu_hat.mean())
     mu_shrunk = mu_hat + lambda0 * mu_bar * np.ones(N)
 
-    # Eigendecomposition
+    # Eigendecomposition — sort descending to match R's eigen() convention
     eigvals, eigvecs = np.linalg.eigh(sigma_hat)
+    order   = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
     eigvals = np.maximum(eigvals, 1e-12)
     sqrt_ev = np.sqrt(eigvals)
 
-    sigma_half     = eigvecs @ np.diag(sqrt_ev) @ eigvecs.T
-    sigma_inv_half = eigvecs @ np.diag(1.0 / sqrt_ev) @ eigvecs.T
+    sigma_half = eigvecs @ np.diag(sqrt_ev) @ eigvecs.T
 
-    mu_tilde = sigma_inv_half @ mu_shrunk
+    # mu_tilde uses only eigenvalues above threshold (avoids inverting near-zeros)
+    keep        = eigvals > 1e-10
+    V_k         = eigvecs[:, keep]
+    inv_sqrt_k  = 1.0 / np.sqrt(eigvals[keep])
+    mu_tilde    = V_k @ (inv_sqrt_k * (V_k.T @ mu_shrunk))   # truncated Sigma^{-1/2} @ mu
 
     # Augmented system
     X_aug = np.vstack([sigma_half, np.sqrt(lambda2) * np.eye(N)])
@@ -195,7 +201,7 @@ def _ap_prune(
         if w is None:
             w = coef_path[:, -1].copy()
 
-        # Long-only + normalize
+        # Long-only + normalize (paper uses long-only investment strategies)
         w = np.maximum(w, 0.0)
         total = w.sum()
         if total < 1e-12:
@@ -255,17 +261,22 @@ def ap_pruning_static_optimize(
     scales = np.array([_depth_scale(c) for c in cols])
     x_scaled = x_raw * scales[np.newaxis, :]
 
-    # ── Subtract risk-free rate for estimation ────────────────────────────
+    # ── Subtract rf FIRST, then depth-scale (correct order) ─────────────
+    # Wrong order (scale then rf): E[x]*scale - rf can be negative for deep nodes
+    #   e.g. 0.8% raw × 0.25 scale = 0.2%, minus rf 0.4% = -0.2% (negative!)
+    # Right order (rf then scale): (E[x] - rf)*scale always positive if equity premium > 0
+    #   e.g. (0.8% - 0.4%) × 0.25 = 0.1% (positive)
     rf_arr = _align_rf(rf, len(df))
-    x_excess = x_scaled - rf_arr[:, np.newaxis]
+    x_excess_unscaled = x_raw - rf_arr[:, np.newaxis]          # raw minus rf
+    x_scaled_excess   = x_excess_unscaled * scales[np.newaxis, :]  # then scale
 
     # ── Train / valid / test split ────────────────────────────────────────
     n_valid = n_train_valid // cv_n
     n_train = n_train_valid - n_valid
 
-    x_tr  = x_excess[:n_train]
-    x_val = x_excess[n_train:n_train_valid]
-    x_te  = x_excess[n_train_valid:]   # used for gross_ret (already excess)
+    x_tr  = x_scaled_excess[:n_train]
+    x_val = x_scaled_excess[n_train:n_train_valid]
+    x_te  = x_scaled_excess[n_train_valid:]   # excess scaled — used for both estimation and gross_ret
 
     N = len(cols)
 
@@ -293,7 +304,7 @@ def ap_pruning_static_optimize(
 
     # ── Re-estimate on full train+valid with best params ──────────────────
     k_weights_full = _ap_prune(
-        x_excess[:n_train_valid],
+        x_scaled_excess[:n_train_valid],
         best_sel.lambda0, best_sel.lambda2,
         kmin=best_sel.k, kmax=best_sel.k,
     )
@@ -343,7 +354,7 @@ def ap_pruning_static_optimize(
     # ── Diagnostics ───────────────────────────────────────────────────────
     tr_ret  = x_tr  @ final_w
     val_ret = x_val @ final_w
-    te_ret  = gross
+    te_ret  = x_te  @ final_w
 
     diag = pd.DataFrame({
         "sample":            ["train", "valid", "test"],
@@ -380,7 +391,8 @@ def rolling_tc_optimize(
 
     Each month t:
       1. Estimate mu, sigma on x[t-window:t] (with mean shrinkage eta)
-      2. Solve: min_w  1/2 w^T sigma w + 1/2 lambda_l2 ||w||^2 + lambda_tc ||w - w_{t-1}||_1
+      2. Solve: min_w  1/2 w^T sigma w - mu^T w + 1/2 lambda_l2 ||w||^2
+                                                + lambda_tc ||w - w_{t-1}||_1
          s.t. sum(w)=1, w>=0 (if long_only)
       3. Turnover and TC computed at portfolio level ("portfolio") or
          by aggregating to stock level ("stock").
@@ -426,9 +438,13 @@ def rolling_tc_optimize(
 
         # ── Solve QP ────────────────────────────────────────────────────
         def obj(w):
+            # Critical term: expected-return reward. Without this, the optimizer
+            # collapses toward minimum-variance + turnover suppression, often
+            # producing nearly static weights and near-zero turnover.
             return (0.5 * w @ sigma @ w
-                    + 0.5 * lambda_l2 * np.dot(w, w)
-                    + lambda_tc * np.sum(np.abs(w - w_prev)))
+                - np.dot(mu_shrunk, w)
+                + 0.5 * lambda_l2 * np.dot(w, w)
+                + lambda_tc * np.sum(np.abs(w - w_prev)))
 
         constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
         bounds = [(0.0, 1.0)] * K if long_only else [(-2.0, 2.0)] * K
@@ -439,6 +455,7 @@ def rolling_tc_optimize(
                        constraints=constraints,
                        options={"maxiter": 1000, "ftol": 1e-10})
         w = res.x if res.success else x0
+        w[np.abs(w) < 1e-12] = 0.0
         w = np.clip(w, 0.0, None) if long_only else w
         w = w / w.sum() if w.sum() > 1e-12 else x0
 

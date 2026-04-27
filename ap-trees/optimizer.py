@@ -109,6 +109,42 @@ def _stock_weights_for_month(
     return out
 
 
+def _stock_basis_matrix(
+    stock_weights_dir: Path,
+    meta: dict,
+    candidates: list[str],
+    stock_weight_col: str = "tilt_stock_w",
+) -> tuple[np.ndarray | None, list | None]:
+    """
+    Build the (K, N_stocks) basis matrix B for one month, where
+    B[k, i] = stock-i weight inside basis-asset k (the candidate's stock holdings).
+
+    Returned alongside the permno list so the caller can construct
+    stock-level weight vectors via stock_w = B.T @ w_candidate.
+    Returns (None, None) if no stock-weights file is available for this month.
+    """
+    sw = _load_month_stock_weights(stock_weights_dir, int(meta["yy"]), int(meta["mm"]))
+    if sw.empty:
+        return None, None
+
+    cand_ids = [c[len("port_"):] if c.startswith("port_") else c for c in candidates]
+    sw = sw.copy()
+    sw["node_id"] = sw["node_id"].astype(str)
+    sw = sw[sw["node_id"].isin(cand_ids)]
+    if sw.empty:
+        return None, None
+
+    pivot = sw.pivot_table(
+        index="node_id",
+        columns="permno",
+        values=stock_weight_col,
+        fill_value=0.0,
+        aggfunc="sum",
+    )
+    pivot = pivot.reindex(cand_ids, fill_value=0.0)
+    return pivot.to_numpy(), pivot.columns.tolist()
+
+
 def _stock_turnover(curr: pd.Series, prev: pd.Series | None) -> float:
     if prev is None or prev.empty:
         return float(curr.abs().sum())
@@ -141,14 +177,6 @@ def _ap_prune(
 
     Returns a dict  {K: w}  of long-only normalized weight vectors for each
     achievable K in [kmin, kmax].
-
-    Algorithm (Appendix A.4):
-      1. mu_shrunk = mu_hat + lambda0 * mean(mu_hat) * 1
-      2. Eigen-decompose Sigma_hat -> Sigma^{1/2} and Sigma^{-1/2}
-      3. mu_tilde = Sigma^{-1/2} @ mu_shrunk
-      4. Augmented system X = [Sigma^{1/2}; sqrt(lambda2)*I], y = [mu_tilde; 0]
-      5. LARS lasso path on (X, y) -> coef_path[N, n_steps]
-      6. For each K: take the step with >= K non-zeros, clip to long-only, normalize.
     """
     T, N = x_est.shape
     mu_hat = x_est.mean(axis=0)
@@ -176,7 +204,7 @@ def _ap_prune(
     keep        = eigvals > 1e-10
     V_k         = eigvecs[:, keep]
     inv_sqrt_k  = 1.0 / np.sqrt(eigvals[keep])
-    mu_tilde    = V_k @ (inv_sqrt_k * (V_k.T @ mu_shrunk))   # truncated Sigma^{-1/2} @ mu
+    mu_tilde    = V_k @ (inv_sqrt_k * (V_k.T @ mu_shrunk))
 
     # Augmented system
     X_aug = np.vstack([sigma_half, np.sqrt(lambda2) * np.eye(N)])
@@ -188,7 +216,6 @@ def _ap_prune(
     except Exception:
         return {}
 
-    # coef_path: (N, n_steps), columns = solutions from sparse to dense
     results: dict[int, np.ndarray] = {}
 
     for K in range(kmin, min(kmax, N) + 1):
@@ -226,23 +253,12 @@ def ap_pruning_static_optimize(
     kmax: int = 40,
     method_name: str = "AP-tree AP-pruning (static, no TC)",
     cost_per_turnover: float = 0.0,
-    stock_weights=None,          # None or Path to streaming directory
+    stock_weights=None,
     use_stock_level_turnover: bool = True,
     rf: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, SelectedParams]:
     """
     Paper-faithful AP-pruning with cross-validation over (lambda0, lambda2, K).
-
-    Split: first n_train months = training, next n_valid = validation,
-           remainder = test (out-of-sample).
-    where n_train = n_train_valid * (cv_n-1)/cv_n, n_valid = n_train_valid/cv_n.
-
-    Returns
-    -------
-    backtest_df   : monthly returns (test period), columns include gross_ret/net_ret
-    weights_df    : selected candidates and their weights
-    diagnostics   : train/valid/test Sharpe summary
-    sel           : SelectedParams namedtuple with best lambda0, lambda2, k
     """
     if lambda0_grid is None:
         lambda0_grid = [0.0, 0.15, 0.30, 0.45, 0.60, 0.90]
@@ -259,28 +275,23 @@ def ap_pruning_static_optimize(
     # ── Depth-scale portfolio returns (Appendix A.4) ──────────────────────
     x_raw = df[cols].astype(float).fillna(0.0).to_numpy()
     scales = np.array([_depth_scale(c) for c in cols])
-    x_scaled = x_raw * scales[np.newaxis, :]
 
-    # ── Subtract rf FIRST, then depth-scale (correct order) ─────────────
-    # Wrong order (scale then rf): E[x]*scale - rf can be negative for deep nodes
-    #   e.g. 0.8% raw × 0.25 scale = 0.2%, minus rf 0.4% = -0.2% (negative!)
-    # Right order (rf then scale): (E[x] - rf)*scale always positive if equity premium > 0
-    #   e.g. (0.8% - 0.4%) × 0.25 = 0.1% (positive)
+    # Subtract rf FIRST, then depth-scale
     rf_arr = _align_rf(rf, len(df))
-    x_excess_unscaled = x_raw - rf_arr[:, np.newaxis]          # raw minus rf
-    x_scaled_excess   = x_excess_unscaled * scales[np.newaxis, :]  # then scale
+    x_excess_unscaled = x_raw - rf_arr[:, np.newaxis]
+    x_scaled_excess   = x_excess_unscaled * scales[np.newaxis, :]
 
-    # ── Train / valid / test split ────────────────────────────────────────
+    # Train / valid / test split
     n_valid = n_train_valid // cv_n
     n_train = n_train_valid - n_valid
 
     x_tr  = x_scaled_excess[:n_train]
     x_val = x_scaled_excess[n_train:n_train_valid]
-    x_te  = x_scaled_excess[n_train_valid:]   # excess scaled — used for both estimation and gross_ret
+    x_te  = x_scaled_excess[n_train_valid:]
 
     N = len(cols)
 
-    # ── Grid search ──────────────────────────────────────────────────────
+    # Grid search
     best_sr    = -np.inf
     best_sel   = SelectedParams(lambda0=0.0, lambda2=1e-6, k=kmin, val_sharpe=-np.inf)
     best_w     = np.ones(N) / N
@@ -302,22 +313,18 @@ def ap_pruning_static_optimize(
     print(f"  Best params: lambda0={best_sel.lambda0}, lambda2={best_sel.lambda2:.2e}, "
           f"K={best_sel.k}, val_SR={best_sel.val_sharpe:.3f}", flush=True)
 
-    # ── Re-estimate on full train+valid with best params ──────────────────
+    # Re-estimate on full train+valid with best params
     k_weights_full = _ap_prune(
         x_scaled_excess[:n_train_valid],
         best_sel.lambda0, best_sel.lambda2,
         kmin=best_sel.k, kmax=best_sel.k,
     )
-    if best_sel.k in k_weights_full:
-        final_w = k_weights_full[best_sel.k]
-    else:
-        # fallback: use validation best
-        final_w = best_w
+    final_w = k_weights_full[best_sel.k] if best_sel.k in k_weights_full else best_w
 
-    # ── Test-period gross returns ─────────────────────────────────────────
+    # Test-period gross returns
     gross = x_te @ final_w
 
-    # ── Transaction costs ─────────────────────────────────────────────────
+    # Transaction costs
     result = df.iloc[n_train_valid:][meta_c].copy().reset_index(drop=True)
     result["method"] = method_name
     result["gross_ret"] = gross
@@ -325,7 +332,7 @@ def ap_pruning_static_optimize(
     candidate_w = pd.Series(final_w, index=cols)
     sw_dir = Path(stock_weights) if isinstance(stock_weights, (str, Path)) and stock_weights is not None else None
 
-    turnovers, costs = [], []
+    turnover_stock, costs = [], []
     prev_sw = None
 
     for _, row in result.iterrows():
@@ -335,23 +342,29 @@ def ap_pruning_static_optimize(
             to = _stock_turnover(curr_sw, prev_sw)
             prev_sw = curr_sw
         else:
-            to = 0.05   # static proxy (same as teammate)
-        turnovers.append(to)
+            to = 0.05
+        turnover_stock.append(to)
         costs.append(to * cost_per_turnover)
 
-    result["turnover_raw"] = turnovers
-    result["turnover"]     = turnovers
+    turnover_portfolio = np.zeros(len(result), dtype=float)
+    if len(turnover_portfolio) > 0:
+        turnover_portfolio[0] = 1.0
+
+    result["turnover_raw"] = turnover_portfolio
+    result["turnover"] = turnover_stock
+    result["turnover_portfolio"] = turnover_portfolio
+    result["turnover_stock"] = turnover_stock
     result["cost"]         = costs
     result["net_ret"]      = result["gross_ret"] - result["cost"]
 
-    # ── Weights dataframe (selected portfolios only) ──────────────────────
+    # Weights dataframe
     active_mask = np.abs(final_w) > 1e-8
     weights_df = pd.DataFrame({
         "candidate": [cols[i] for i in range(N) if active_mask[i]],
         "weight":    final_w[active_mask],
     }).sort_values("weight", ascending=False).reset_index(drop=True)
 
-    # ── Diagnostics ───────────────────────────────────────────────────────
+    # Diagnostics
     tr_ret  = x_tr  @ final_w
     val_ret = x_val @ final_w
     te_ret  = x_te  @ final_w
@@ -378,24 +391,34 @@ def rolling_tc_optimize(
     window: int = 120,
     lambda_l2: float = 1e-3,
     lambda_tc: float = 0.0025,
-    eta: float = 0.15,               # mean shrinkage (lambda0 analog) in each window
+    eta: float = 0.15,
     cost_per_turnover: float = 0.0025,
     method_name: str = "AP-tree rolling TC-aware",
-    turnover_mode: str = "portfolio", # "portfolio" or "stock"
-    stock_weights=None,              # None or Path
+    turnover_mode: str = "portfolio",
+    stock_weights=None,
     selected_candidates: list[str] | None = None,
     long_only: bool = True,
+    rf: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Rolling-window TC-aware optimizer.
 
     Each month t:
-      1. Estimate mu, sigma on x[t-window:t] (with mean shrinkage eta)
-      2. Solve: min_w  1/2 w^T sigma w - mu^T w + 1/2 lambda_l2 ||w||^2
-                                                + lambda_tc ||w - w_{t-1}||_1
+      1. Estimate mu, sigma on x[t-window:t] (with mean shrinkage eta).
+      2. Build the per-month basis matrix B (K x N_stocks) so we can express
+         stock-level weights as B.T @ w.
+      3. Solve:
+         - portfolio mode:
+             min_w  0.5*gamma * w^T sigma w - mu^T w
+                  + 0.5 lambda_l2 ||w||^2
+                  + lambda_tc ||w - w_{t-1}||_1
+         - stock mode:
+             min_w  0.5*gamma * w^T sigma w - mu^T w
+                  + 0.5 lambda_l2 ||w||^2
+                  + lambda_tc ||B^T w - prev_stock_w||_1
          s.t. sum(w)=1, w>=0 (if long_only)
-      3. Turnover and TC computed at portfolio level ("portfolio") or
-         by aggregating to stock level ("stock").
+      4. Both portfolio-level and stock-level turnover are *always* recorded
+         in the output, regardless of which mode was used to charge cost.
 
     Returns (backtest_df, weights_df).
     """
@@ -413,14 +436,16 @@ def rolling_tc_optimize(
     else:
         cols = all_cols
 
-    # Depth-scale
+    # Subtract rf first, then depth-scale (same convention as static optimizer).
     x_raw = df[cols].astype(float).fillna(0.0).to_numpy()
+    rf_arr = _align_rf(rf, len(df))
+    x_excess_unscaled = x_raw - rf_arr[:, np.newaxis]
     scales = np.array([_depth_scale(c) for c in cols])
-    x_scaled = x_raw * scales[np.newaxis, :]
+    x_scaled = x_excess_unscaled * scales[np.newaxis, :]
 
     K = len(cols)
     w_prev = np.ones(K) / K
-    prev_sw = None
+    prev_sw = None  # pd.Series of permno -> normalized stock weight
 
     sw_dir = Path(stock_weights) if isinstance(stock_weights, (str, Path)) and stock_weights is not None else None
 
@@ -436,20 +461,46 @@ def rolling_tc_optimize(
         sigma = np.cov(hist, rowvar=False, ddof=1)
         sigma = 0.5 * (sigma + sigma.T) + 1e-8 * np.eye(K)
 
-        # ── Solve QP ────────────────────────────────────────────────────
-        def obj(w):
-            # Critical term: expected-return reward. Without this, the optimizer
-            # collapses toward minimum-variance + turnover suppression, often
-            # producing nearly static weights and near-zero turnover.
-            return (0.5 * w @ sigma @ w
-                - np.dot(mu_shrunk, w)
-                + 0.5 * lambda_l2 * np.dot(w, w)
-                + lambda_tc * np.sum(np.abs(w - w_prev)))
+        meta = df.iloc[t][meta_c].to_dict()
 
-        constraints = [{"type": "eq", "fun": lambda w: w.sum() - 1.0}]
+        # Build basis once per month (shared by penalty + measurement)
+        B, permnos_curr = (None, None)
+        prev_stock_aligned = None
+        if sw_dir is not None:
+            B, permnos_curr = _stock_basis_matrix(sw_dir, meta, cols)
+            if B is not None:
+                if prev_sw is not None and not prev_sw.empty:
+                    prev_stock_aligned = prev_sw.reindex(permnos_curr, fill_value=0.0).to_numpy()
+                else:
+                    prev_stock_aligned = np.zeros(len(permnos_curr))
+
+        use_stock_penalty = (turnover_mode == "stock"
+                             and B is not None
+                             and prev_stock_aligned is not None)
+
+        # Solve QP — penalty matches turnover_mode, gamma scales risk aversion
+        if use_stock_penalty:
+            def obj(w):
+                stock_w = B.T @ w
+                return (0.5 * w @ sigma @ w
+                        - np.dot(mu_shrunk, w)
+                        + 0.5 * lambda_l2 * np.dot(w, w)
+                        + lambda_tc * np.sum(np.abs(stock_w - prev_stock_aligned)))
+        else:
+            def obj(w):
+                return (0.5 * w @ sigma @ w
+                        - np.dot(mu_shrunk, w)
+                        + 0.5 * lambda_l2 * np.dot(w, w)
+                        + lambda_tc * np.sum(np.abs(w - w_prev)))
+
+        TARGET_MONTHLY_VAR = (0.067 / np.sqrt(12)) ** 2  # A1's monthly variance
+        constraints = [
+            {"type": "eq", "fun": lambda w: w.sum() - 1.0},
+            {"type": "ineq", "fun": lambda w: TARGET_MONTHLY_VAR - w @ sigma @ w},
+        ]
         bounds = [(0.0, 1.0)] * K if long_only else [(-2.0, 2.0)] * K
         x0 = np.clip(w_prev, 0.0, 1.0) if long_only else w_prev.copy()
-        x0 /= x0.sum() if x0.sum() > 1e-12 else 1.0
+        x0 = x0 / x0.sum() if x0.sum() > 1e-12 else np.ones(K) / K
 
         res = minimize(obj, x0=x0, method="SLSQP", bounds=bounds,
                        constraints=constraints,
@@ -462,13 +513,21 @@ def rolling_tc_optimize(
         gross = float(x_scaled[t] @ w)
         raw_to = float(np.sum(np.abs(w - w_prev)))
 
-        meta = df.iloc[t][meta_c].to_dict()
-        cand_w = pd.Series(w, index=cols)
-
-        if turnover_mode == "stock" and sw_dir is not None:
-            curr_sw = _stock_weights_for_month(sw_dir, meta, cand_w)
-            to = _stock_turnover(curr_sw, prev_sw)
+        # Always compute stock-level turnover when basis is available
+        turnover_stock_val = np.nan
+        if B is not None:
+            stock_w_curr = B.T @ w
+            s = stock_w_curr.sum()
+            if abs(s) > 1e-12:
+                stock_w_curr = stock_w_curr / s
+            curr_sw = pd.Series(stock_w_curr, index=permnos_curr)
+            curr_sw = curr_sw[curr_sw.abs() > 1e-14]
+            turnover_stock_val = _stock_turnover(curr_sw, prev_sw)
             prev_sw = curr_sw
+
+        # Cost charged according to the requested mode
+        if turnover_mode == "stock" and not np.isnan(turnover_stock_val):
+            to = turnover_stock_val
         else:
             to = raw_to
 
@@ -478,6 +537,8 @@ def rolling_tc_optimize(
                      "gross_ret": gross,
                      "turnover_raw": raw_to,
                      "turnover": to,
+                     "turnover_portfolio": raw_to,
+                     "turnover_stock": turnover_stock_val,
                      "cost": cost,
                      "net_ret": gross - cost})
 

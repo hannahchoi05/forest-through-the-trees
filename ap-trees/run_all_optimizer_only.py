@@ -4,10 +4,13 @@ import numpy as np
 import pandas as pd
 
 from config import (
+    CHUNK_DIR,
     OUTPUT_DIR,
     FACTOR_DIR,
     DEFAULT_CHARS,
     DEFAULT_TAU,
+    DEFAULT_Y_MIN,
+    DEFAULT_Y_MAX,
     N_TRAIN_VALID,
     CV_N,
     ROLLING_WINDOW,
@@ -23,7 +26,7 @@ from config import (
     TC_ETA,
     TC_LONG_ONLY,
 )
-from data_io import load_yahoo_monthly_benchmark
+from data_io import load_yahoo_monthly_benchmark, load_yearly_chunks
 from optimizer import ap_pruning_static_optimize, rolling_tc_optimize
 from metrics import performance_metrics, add_wealth_drawdown
 from plots import make_all_plots
@@ -84,6 +87,84 @@ def _align_to_common_window(dfs: list[pd.DataFrame]) -> list[pd.DataFrame]:
     return out
 
 
+def _restore_candidate_matrix_from_stock_weights(
+    candidate_path,
+    stock_weights_path,
+    chars: list[str],
+) -> pd.DataFrame:
+    """
+    Rebuild ap_tree_candidate_matrix.csv from streamed monthly stock weights.
+
+    This is much cheaper than rebuilding the full AP-tree set because the node
+    membership and within-node weights have already been checkpointed to disk.
+    """
+    files = sorted(stock_weights_path.glob("*.pkl"))
+    if not files:
+        raise FileNotFoundError(
+            f"Missing stock-weight checkpoint files in {stock_weights_path}."
+        )
+
+    print(
+        f"Candidate matrix missing. Reconstructing from {len(files)} monthly stock-weight files...",
+        flush=True,
+    )
+
+    panel = load_yearly_chunks(CHUNK_DIR, chars, DEFAULT_Y_MIN, DEFAULT_Y_MAX)[
+        ["date", "date_dt", "yy", "mm", "permno", "ret"]
+    ].copy()
+    panel["permno"] = panel["permno"].astype(str)
+
+    month_returns = {
+        key: grp[["permno", "ret"]].set_index("permno")["ret"]
+        for key, grp in panel.groupby(["yy", "mm"], sort=True)
+    }
+    month_meta = (
+        panel[["date", "date_dt", "yy", "mm"]]
+        .drop_duplicates(subset=["yy", "mm"])
+        .sort_values(["yy", "mm"])
+        .set_index(["yy", "mm"])
+    )
+
+    rows = []
+
+    for idx, path in enumerate(files, start=1):
+        yy = int(path.stem.split("_")[0])
+        mm = int(path.stem.split("_")[1])
+
+        if idx == 1 or idx % 25 == 0:
+            print(
+                f"  Restoring candidate matrix month {idx}/{len(files)} ({yy}-{mm:02d})",
+                flush=True,
+            )
+
+        if (yy, mm) not in month_returns:
+            continue
+
+        sw = pd.read_pickle(path, compression="gzip")
+        sw["permno"] = sw["permno"].astype(str)
+        sw["ret"] = sw["permno"].map(month_returns[(yy, mm)]).fillna(0.0)
+        sw["weighted_ret"] = sw["base_stock_w"].astype(float) * sw["ret"].astype(float)
+
+        port_ret = sw.groupby("node_id", sort=False)["weighted_ret"].sum()
+        meta = month_meta.loc[(yy, mm)]
+        row = {
+            "date": int(meta["date"]),
+            "date_dt": pd.to_datetime(meta["date_dt"]),
+            "yy": yy,
+            "mm": mm,
+        }
+        row.update({f"port_{node_id}": value for node_id, value in port_ret.items()})
+        rows.append(row)
+
+    if not rows:
+        raise ValueError("Unable to reconstruct any candidate-matrix rows from stock weights.")
+
+    out = pd.DataFrame(rows).sort_values(["yy", "mm"]).reset_index(drop=True)
+    out.to_csv(candidate_path, index=False)
+    print(f"Restored candidate matrix: {candidate_path}", flush=True)
+    return out
+
+
 def main() -> None:
     chars = DEFAULT_CHARS
     subdir = "_".join(chars)
@@ -97,12 +178,6 @@ def main() -> None:
     candidate_path = out_dir / "ap_tree_candidate_matrix.csv"
     stock_weights_path = out_dir / "stock_weights_by_month"
 
-    if not candidate_path.exists():
-        raise FileNotFoundError(
-            f"Missing candidate matrix: {candidate_path}. "
-            "Run the full tree-building pipeline first."
-        )
-
     if not stock_weights_path.exists():
         raise FileNotFoundError(
             f"Missing stock weights directory: {stock_weights_path}. "
@@ -113,11 +188,17 @@ def main() -> None:
     # Matches R Step3_RmRf_Combine_Trees.R which subtracts rf before AP-pruning.
     rf_series = _load_rf()
 
-    print(f"Loading existing candidate matrix: {candidate_path}", flush=True)
-    tilted_returns = pd.read_csv(candidate_path)
-
-    if "date_dt" in tilted_returns.columns:
-        tilted_returns["date_dt"] = pd.to_datetime(tilted_returns["date_dt"])
+    if candidate_path.exists():
+        print(f"Loading existing candidate matrix: {candidate_path}", flush=True)
+        tilted_returns = pd.read_csv(candidate_path)
+        if "date_dt" in tilted_returns.columns:
+            tilted_returns["date_dt"] = pd.to_datetime(tilted_returns["date_dt"])
+    else:
+        tilted_returns = _restore_candidate_matrix_from_stock_weights(
+            candidate_path,
+            stock_weights_path,
+            chars,
+        )
 
     # ============================================================
     # A1: AP-pruning static, no TC
@@ -214,6 +295,7 @@ def main() -> None:
             stock_weights=None,
             selected_candidates=selected_candidates,
             long_only=TC_LONG_ONLY,
+            rf=rf_series,
         )
         bt_b.to_csv(b_path, index=False)
         w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
@@ -242,6 +324,7 @@ def main() -> None:
             stock_weights=stock_weights_path,
             selected_candidates=selected_candidates,
             long_only=TC_LONG_ONLY,
+            rf=rf_series,
         )
         bt_c.to_csv(c_path, index=False)
         w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)

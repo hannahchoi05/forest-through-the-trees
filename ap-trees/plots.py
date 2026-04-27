@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -16,28 +17,13 @@ def _x(g: pd.DataFrame):
     ) + pd.offsets.MonthEnd(0)
 
 
-def _style_for_method(method: str) -> dict:
-    m = method.lower()
-    if "s&p" in m or "spy" in m:
-        return {"linewidth": 2.4, "linestyle": "-", "alpha": 0.95}
-    if "static, no tc" in m:
-        return {"linewidth": 2.0, "linestyle": "-", "alpha": 0.95}
-    if "static + stock-level tc" in m:
-        return {"linewidth": 2.0, "linestyle": "--", "alpha": 0.95}
-    if "portfolio-level tc" in m:
-        return {"linewidth": 1.9, "linestyle": "-.", "alpha": 0.95}
-    if "stock-level tc" in m:
-        return {"linewidth": 1.9, "linestyle": ":", "alpha": 0.95}
-    return {"linewidth": 1.8, "linestyle": "-", "alpha": 0.9}
-
-
 def plot_cumulative_gross(backtest: pd.DataFrame, out_dir: Path):
     d = add_wealth_drawdown(backtest)
 
     plt.figure(figsize=(10, 6))
 
     for method, g in d.groupby("method", sort=False):
-        plt.plot(_x(g), g["wealth_gross"], label=method, **_style_for_method(method))
+        plt.plot(_x(g), g["wealth_gross"], label=method)
 
     plt.title("Plot A: Cumulative Gross Returns")
     plt.ylabel("Gross wealth")
@@ -53,7 +39,7 @@ def plot_cumulative_net(backtest: pd.DataFrame, out_dir: Path):
     plt.figure(figsize=(10, 6))
 
     for method, g in d.groupby("method", sort=False):
-        plt.plot(_x(g), g["wealth_net"], label=method, **_style_for_method(method))
+        plt.plot(_x(g), g["wealth_net"], label=method)
 
     plt.title("Plot B: Cumulative Net Returns")
     plt.ylabel("Net wealth")
@@ -69,8 +55,8 @@ def plot_gross_vs_net(backtest: pd.DataFrame, out_dir: Path):
     for method, g in d.groupby("method", sort=False):
         plt.figure(figsize=(10, 6))
 
-        plt.plot(_x(g), g["wealth_gross"], label="Gross", linewidth=2.0, linestyle="-")
-        plt.plot(_x(g), g["wealth_net"], label="Net", linewidth=2.0, linestyle="--")
+        plt.plot(_x(g), g["wealth_gross"], label="Gross")
+        plt.plot(_x(g), g["wealth_net"], label="Net")
 
         plt.title(f"Plot C: Gross vs Net - {method}")
         plt.ylabel("Wealth")
@@ -91,7 +77,7 @@ def plot_drawdown(backtest: pd.DataFrame, out_dir: Path):
     plt.figure(figsize=(10, 6))
 
     for method, g in d.groupby("method", sort=False):
-        plt.plot(_x(g), g["drawdown_net"], label=method, **_style_for_method(method))
+        plt.plot(_x(g), g["drawdown_net"], label=method)
 
     plt.title("Plot D: Drawdown (Net)")
     plt.ylabel("Drawdown")
@@ -111,7 +97,6 @@ def plot_turnover(backtest: pd.DataFrame, out_dir: Path, rolling: int = 12):
             _x(h),
             h["turnover"].rolling(rolling, min_periods=1).mean(),
             label=method,
-            **_style_for_method(method),
         )
 
     plt.title(f"Plot E: Turnover ({rolling}-month MA)")

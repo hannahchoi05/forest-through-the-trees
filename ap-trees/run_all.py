@@ -151,6 +151,7 @@ def main() -> None:
     bt_a1.to_csv(out_dir / "backtest_A1_static_no_tc.csv", index=False)
     w_a1.to_csv(out_dir / "weights_A1_static_no_tc.csv", index=False)
     diag_a1.to_csv(out_dir / "diagnostics_A1_static_no_tc.csv", index=False)
+    selected_candidates = w_a1["candidate"].tolist()
 
     # ------------------------------------------------------------------
     # Variant A2: Static optimizer, stock-level transaction cost
@@ -189,6 +190,7 @@ def main() -> None:
         method_name=METHOD_B,
         stock_weights=None,
         use_stock_level_turnover=False,
+        selected_candidates=selected_candidates,
     )
     bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
     w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
@@ -209,6 +211,7 @@ def main() -> None:
         method_name=METHOD_C,
         stock_weights=stock_weights_dir,
         use_stock_level_turnover=True,
+        selected_candidates=selected_candidates,
     )
     bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv", index=False)
     w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)

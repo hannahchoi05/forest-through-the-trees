@@ -373,17 +373,31 @@ def ap_pruning_static_optimize(
         beta_full = np.ones(p) / p
         best_params = {"lambda_l2": np.nan, "lambda0": np.nan}
 
-    # Normalize final weights — matches R: b = b / abs(sum(b))
-    w = _normalize_b(beta_full)
-    if np.all(w == 0.0):
-        w = np.ones(p) / p
+    # Normalize final LARS coefficients in TWO ways:
+    #   1. w_sdf   = paper/SDF convention: b / abs(sum(b))
+    #   2. w_trade = tradable convention: b / sum(abs(b))
+    #
+    # For Triple Sort, adj_w = 1, so the clean conversion is simply
+    #     b_tilde = beta_full
+    #     w_trade = b_tilde / sum(abs(b_tilde))
+    #
+    # Use w_trade for backtest returns, stock-level turnover, saved trading
+    # weights, and summary metrics. Keep w_sdf only for diagnostics against
+    # the paper's signed-sum/SDF convention.
+    w_sdf = _normalize_b(beta_full)
+    w_trade = _normalize_gross_exposure(beta_full)
+
+    if np.all(w_trade == 0.0):
+        w_trade = np.ones(p) / p
+    if np.all(w_sdf == 0.0):
+        w_sdf = w_trade.copy()
 
     # --- Backtest on test period ---
     meta_cols = _meta_cols(df)
     result = df.iloc[n_train_valid:][meta_cols].copy().reset_index(drop=True)
     result["method"] = method_name
 
-    gross = x_test @ w
+    gross = x_test @ w_trade
     result["gross_ret"] = gross
 
     # --- Turnover and costs ---
@@ -400,7 +414,7 @@ def ap_pruning_static_optimize(
         if use_stock_level_turnover:
             m = panel_g.get_group((int(row["yy"]), int(row["mm"])))
             curr_stock_w = _final_stock_weights_for_month(
-                m, candidate_weights=w, n_bins=n_bins,
+                m, candidate_weights=w_trade, n_bins=n_bins,
             )
             turnover = _stock_turnover(curr_stock_w, prev_stock_w)
             prev_stock_w = curr_stock_w
@@ -415,38 +429,53 @@ def ap_pruning_static_optimize(
     result["net_ret"]      = result["gross_ret"] - result["cost"]
 
     # --- Weights output (nonzero only) ---
-    weights = pd.DataFrame({"candidate": cols, "weight": w})
+    # Store both conventions so it is explicit in the CSV. The main "weight"
+    # column is the tradable gross-normalized weight used by the backtest.
+    weights = pd.DataFrame({
+        "candidate": cols,
+        "weight": w_trade,
+        "weight_trade": w_trade,
+        "weight_sdf": w_sdf,
+    })
     weights = (
-        weights[weights["weight"].abs() > 1e-12]
-        .sort_values("weight", ascending=False)
+        weights[weights["weight_trade"].abs() > 1e-12]
+        .sort_values("weight_trade", ascending=False)
         .reset_index(drop=True)
     )
 
     # --- Diagnostics ---
-    cv_train_ret       = x_train       @ w
-    cv_valid_ret       = x_valid       @ w
-    full_train_val_ret = x_train_valid @ w
-    test_ret           = x_test        @ w
+    cv_train_ret_sdf       = x_train       @ w_sdf
+    cv_valid_ret_sdf       = x_valid       @ w_sdf
+    full_train_val_ret_sdf = x_train_valid @ w_sdf
+    test_ret_sdf           = x_test        @ w_sdf
+
+    cv_train_ret_trade       = x_train       @ w_trade
+    cv_valid_ret_trade       = x_valid       @ w_trade
+    full_train_val_ret_trade = x_train_valid @ w_trade
+    test_ret_trade           = x_test        @ w_trade
 
     diag = pd.DataFrame({
         "sample":            ["cv_train", "cv_valid", "full_train_valid", "test"],
         "start_row":         [0, n_train, 0, n_train_valid],
         "end_row_exclusive": [n_train, n_train_valid, n_train_valid, len(df)],
         "sharpe_sdf_monthly": [
-            _safe_sr(cv_train_ret),
-            _safe_sr(cv_valid_ret),
-            _safe_sr(full_train_val_ret),
-            _safe_sr(test_ret),
+            _safe_sr(cv_train_ret_sdf),
+            _safe_sr(cv_valid_ret_sdf),
+            _safe_sr(full_train_val_ret_sdf),
+            _safe_sr(test_ret_sdf),
         ],
         "sharpe_trade_monthly": [
-            _safe_sr(cv_train_ret),
-            _safe_sr(cv_valid_ret),
-            _safe_sr(full_train_val_ret),
-            _safe_sr(test_ret),
+            _safe_sr(cv_train_ret_trade),
+            _safe_sr(cv_valid_ret_trade),
+            _safe_sr(full_train_val_ret_trade),
+            _safe_sr(test_ret_trade),
         ],
         "best_lambda_l2": [best_params.get("lambda_l2", np.nan)] * 4,
         "best_lambda0":   [best_params.get("lambda0",   np.nan)] * 4,
-        "k_nonzero":      [int(np.sum(np.abs(w) > 1e-10))]       * 4,
+        "k_nonzero":      [int(np.sum(np.abs(w_trade) > 1e-10))] * 4,
+        "gross_exposure_trade": [float(np.sum(np.abs(w_trade)))] * 4,
+        "signed_sum_trade": [float(np.sum(w_trade))] * 4,
+        "signed_sum_sdf": [float(np.sum(w_sdf))] * 4,
         "best_valid_sr":  [best_sr] * 4,
     })
 
@@ -467,7 +496,7 @@ def solve_portfolio_qp(
     mu0: float | None = None,
     long_only: bool = True,
 ) -> np.ndarray:
-    mu    = np.asarray(mu,    dtype=float)
+    mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     k = len(mu)
 
@@ -478,7 +507,7 @@ def solve_portfolio_qp(
 
     sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
     sigma = 0.5 * (sigma + sigma.T) + 1e-8 * np.eye(k)
-    mu    = np.nan_to_num(mu,    nan=0.0, posinf=0.0, neginf=0.0)
+    mu = np.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
 
     def obj(w: np.ndarray) -> float:
         return float(
@@ -488,24 +517,32 @@ def solve_portfolio_qp(
             + lambda_tc * np.sum(np.abs(w - w_prev))
         )
 
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+    if long_only:
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+        bounds = [(0.0, 1.0) for _ in range(k)]
+        x0 = np.clip(w_prev, 0.0, 1.0)
+
+        if abs(x0.sum()) < 1e-12:
+            x0 = np.ones(k) / k
+        else:
+            x0 = x0 / x0.sum()
+    else:
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(np.abs(w)) - 1.0}]
+        bounds = [(-1.0, 1.0) for _ in range(k)]
+        x0 = _normalize_gross_exposure(w_prev)
+
+        if np.sum(np.abs(x0)) < 1e-12:
+            x0 = np.ones(k) / k
+
     if mu0 is not None:
         constraints.append({"type": "ineq", "fun": lambda w: float(w @ mu - mu0)})
 
-    if long_only:
-        bounds = [(0.0, 1.0) for _ in range(k)]
-        x0 = np.clip(w_prev, 0.0, 1.0)
-    else:
-        bounds = [(-1.0, 1.0) for _ in range(k)]
-        x0 = w_prev.copy()
-
-    if abs(x0.sum()) < 1e-12:
-        x0 = np.ones(k) / k
-    else:
-        x0 = x0 / x0.sum()
-
     res = minimize(
-        obj, x0=x0, method="SLSQP", bounds=bounds, constraints=constraints,
+        obj,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
         options={"maxiter": 500, "ftol": 1e-9, "disp": False},
     )
 
@@ -517,9 +554,14 @@ def solve_portfolio_qp(
         return _normalize_gross_exposure(w_prev)
 
     w[np.abs(w) < 1e-12] = 0.0
-    if abs(w.sum()) < 1e-12:
-        return _normalize_gross_exposure(w_prev)
-    return w / w.sum()
+
+    if long_only:
+        s = np.sum(w)
+        if abs(s) < 1e-12:
+            return np.ones(k) / k
+        return w / s
+
+    return _normalize_gross_exposure(w)
 
 
 # ---------------------------------------------------------------------------
@@ -541,21 +583,28 @@ def solve_tc_mean_variance_qp(
     """
     Rolling TC-aware ablation objective:
         min_w 0.5 w'Σw - eta μ'w + 0.5 λ2||w||_2^2 + λtc * turnover(w)
+
+    If long_only=True:
+        sum(w) = 1, w >= 0
+
+    If long_only=False:
+        sum(abs(w)) = 1, -1 <= w_i <= 1
     """
     if turnover_mode not in {"portfolio", "stock"}:
         raise ValueError("turnover_mode must be 'portfolio' or 'stock'.")
 
-    mu    = np.asarray(mu,    dtype=float)
+    mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     w_prev = np.asarray(w_prev, dtype=float)
     k = len(mu)
 
     sigma = np.nan_to_num(sigma, nan=0.0, posinf=0.0, neginf=0.0)
     sigma = 0.5 * (sigma + sigma.T) + 1e-8 * np.eye(k)
-    mu    = np.nan_to_num(mu,    nan=0.0, posinf=0.0, neginf=0.0)
+    mu = np.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
 
     if turnover_mode == "stock" and stock_matrix is not None and stock_matrix.size > 0:
         M = np.asarray(stock_matrix, dtype=float)
+
         if prev_stock_vec is None:
             prev_stock_vec = np.zeros(M.shape[0])
         else:
@@ -575,22 +624,29 @@ def solve_tc_mean_variance_qp(
             + float(lambda_tc) * tc_penalty(w)
         )
 
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
     if long_only:
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
         bounds = [(0.0, 1.0) for _ in range(k)]
         x0 = np.clip(w_prev, 0.0, 1.0)
-    else:
-        bounds = [(-1.0, 1.0) for _ in range(k)]
-        x0 = w_prev.copy()
 
-    if abs(x0.sum()) <= 1e-12:
-        x0 = np.ones(k) / k
+        if abs(x0.sum()) <= 1e-12:
+            x0 = np.ones(k) / k
+        else:
+            x0 = x0 / x0.sum()
     else:
-        x0 = x0 / x0.sum()
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(np.abs(w)) - 1.0}]
+        bounds = [(-1.0, 1.0) for _ in range(k)]
+        x0 = _normalize_gross_exposure(w_prev)
+
+        if np.sum(np.abs(x0)) <= 1e-12:
+            x0 = np.ones(k) / k
 
     res = minimize(
-        obj, x0=x0, method="SLSQP", bounds=bounds, constraints=constraints,
+        obj,
+        x0=x0,
+        method="SLSQP",
+        bounds=bounds,
+        constraints=constraints,
         options={"maxiter": 500, "ftol": 1e-9, "disp": False},
     )
 
@@ -602,8 +658,14 @@ def solve_tc_mean_variance_qp(
         return _normalize_gross_exposure(w_prev)
 
     w[np.abs(w) < 1e-12] = 0.0
-    return _normalize_gross_exposure(w)
 
+    if long_only:
+        s = np.sum(w)
+        if abs(s) <= 1e-12:
+            return np.ones(k) / k
+        return w / s
+
+    return _normalize_gross_exposure(w)
 
 # ---------------------------------------------------------------------------
 # Stock-level weight helpers (unchanged)
@@ -825,8 +887,8 @@ def rolling_tc_optimize(
 
         if turnover_mode == "stock":
             curr_stock_w = _final_stock_weights_for_month(
-                panel_g.get_group((int(meta["yy"]), int(meta["mm"]))),
-                candidate_weights=w, n_bins=n_bins,
+            panel_g.get_group((int(meta["yy"]), int(meta["mm"]))),
+            candidate_weights=w, n_bins=n_bins,
             )
             turnover     = _stock_turnover(curr_stock_w, prev_stock_w)
             prev_stock_w = curr_stock_w

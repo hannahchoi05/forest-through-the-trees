@@ -61,8 +61,8 @@ LONG_ONLY = True
 
 ROLLING_WINDOW = 120
 TC_COST = 0.0025
-TC_LAMBDA_L2 = 1e-6   # midpoint of paper's log grid (was 1e-3, now corrected)
+TC_LAMBDA_L2 = 1e-2   # midpoint of paper's log grid (was 1e-3, now corrected)
 TC_LAMBDA_TC = 0.0025
-TC_ETA = 1.0
+TC_ETA = 0.15
 TC_LONG_ONLY = False
 TC_MU0 = None

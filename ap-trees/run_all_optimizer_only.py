@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pandas as pd
 
@@ -8,7 +9,6 @@ from config import (
     OUTPUT_DIR,
     FACTOR_DIR,
     DEFAULT_CHARS,
-    DEFAULT_TAU,
     DEFAULT_Y_MIN,
     DEFAULT_Y_MAX,
     N_TRAIN_VALID,
@@ -33,14 +33,6 @@ from plots import make_all_plots
 
 
 def _load_rf() -> np.ndarray | None:
-    """
-    Load monthly risk-free rates from rf_factor.csv and convert to decimal.
-
-    R Step3_RmRf_Combine_Trees.R does:
-        port_ret[,i] = port_ret[,i] - (rf)/100
-    meaning rf_factor.csv stores values as percentage points (e.g. 0.45
-    means 0.45% per month). We divide by 100 here to match that convention.
-    """
     rf_path = FACTOR_DIR / "rf_factor.csv"
 
     if not rf_path.exists():
@@ -53,7 +45,6 @@ def _load_rf() -> np.ndarray | None:
 
     rf_raw = pd.read_csv(rf_path, header=None).squeeze().astype(float).to_numpy()
 
-    # Detect if already in decimal form (median absolute value << 0.01 means decimal)
     if float(np.median(np.abs(rf_raw))) < 0.01:
         print(
             f"Loaded rf series ({len(rf_raw)} months) — values appear already in "
@@ -61,13 +52,13 @@ def _load_rf() -> np.ndarray | None:
             flush=True,
         )
         return rf_raw
-    else:
-        print(
-            f"Loaded rf series ({len(rf_raw)} months) — dividing by 100 to convert "
-            "from percentage points to decimal.",
-            flush=True,
-        )
-        return rf_raw / 100.0
+
+    print(
+        f"Loaded rf series ({len(rf_raw)} months) — dividing by 100 to convert "
+        "from percentage points to decimal.",
+        flush=True,
+    )
+    return rf_raw / 100.0
 
 
 def _align_to_common_window(dfs: list[pd.DataFrame]) -> list[pd.DataFrame]:
@@ -92,12 +83,6 @@ def _restore_candidate_matrix_from_stock_weights(
     stock_weights_path,
     chars: list[str],
 ) -> pd.DataFrame:
-    """
-    Rebuild ap_tree_candidate_matrix.csv from streamed monthly stock weights.
-
-    This is much cheaper than rebuilding the full AP-tree set because the node
-    membership and within-node weights have already been checkpointed to disk.
-    """
     files = sorted(stock_weights_path.glob("*.pkl"))
     if not files:
         raise FileNotFoundError(
@@ -118,6 +103,7 @@ def _restore_candidate_matrix_from_stock_weights(
         key: grp[["permno", "ret"]].set_index("permno")["ret"]
         for key, grp in panel.groupby(["yy", "mm"], sort=True)
     }
+
     month_meta = (
         panel[["date", "date_dt", "yy", "mm"]]
         .drop_duplicates(subset=["yy", "mm"])
@@ -147,6 +133,7 @@ def _restore_candidate_matrix_from_stock_weights(
 
         port_ret = sw.groupby("node_id", sort=False)["weighted_ret"].sum()
         meta = month_meta.loc[(yy, mm)]
+
         row = {
             "date": int(meta["date"]),
             "date_dt": pd.to_datetime(meta["date_dt"]),
@@ -163,6 +150,24 @@ def _restore_candidate_matrix_from_stock_weights(
     out.to_csv(candidate_path, index=False)
     print(f"Restored candidate matrix: {candidate_path}", flush=True)
     return out
+
+
+def _save_selected_params(out_dir, sel) -> None:
+    path = out_dir / "selected_params_A1_static_no_tc.json"
+    payload = {
+        "lambda0": float(sel.lambda0),
+        "lambda2": float(sel.lambda2),
+        "k": int(sel.k),
+        "val_sharpe": float(sel.val_sharpe),
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def _load_selected_params(out_dir):
+    path = out_dir / "selected_params_A1_static_no_tc.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
 
 
 def main() -> None:
@@ -184,39 +189,52 @@ def main() -> None:
             "Run the full tree-building pipeline first."
         )
 
-    # Load rf once here and pass it to both A1 and A2.
-    # Matches R Step3_RmRf_Combine_Trees.R which subtracts rf before AP-pruning.
     rf_series = _load_rf()
 
     if candidate_path.exists():
         print(f"Loading existing candidate matrix: {candidate_path}", flush=True)
-        tilted_returns = pd.read_csv(candidate_path)
-        if "date_dt" in tilted_returns.columns:
-            tilted_returns["date_dt"] = pd.to_datetime(tilted_returns["date_dt"])
+        candidate_returns = pd.read_csv(candidate_path)
+        if "date_dt" in candidate_returns.columns:
+            candidate_returns["date_dt"] = pd.to_datetime(candidate_returns["date_dt"])
     else:
-        tilted_returns = _restore_candidate_matrix_from_stock_weights(
+        candidate_returns = _restore_candidate_matrix_from_stock_weights(
             candidate_path,
             stock_weights_path,
             chars,
         )
 
     # ============================================================
-    # A1: AP-pruning static, no TC
-    # (delete backtest_A1_ap_pruning_static_no_tc.csv to force re-run)
+    # A1: Static AP-pruning, no TC
     # ============================================================
-    a1_path = out_dir / "backtest_A1_ap_pruning_static_no_tc.csv"
-    w_a1_path = out_dir / "weights_A1_ap_pruning_static_no_tc.csv"
+    a1_path = out_dir / "backtest_A1_static_no_tc.csv"
+    w_a1_path = out_dir / "weights_A1_static_no_tc.csv"
+    diag_a1_path = out_dir / "diagnostics_A1_static_no_tc.csv"
+
+    sel = None
 
     if a1_path.exists() and w_a1_path.exists():
-        print("\n[A1] Loading from checkpoint (delete backtest_A1_ap_pruning_static_no_tc.csv to re-run)...", flush=True)
+        print(
+            "\n[A1] Loading from checkpoint "
+            "(delete backtest_A1_static_no_tc.csv and weights_A1_static_no_tc.csv to re-run)...",
+            flush=True,
+        )
         bt_a1 = pd.read_csv(a1_path)
         bt_a1["date_dt"] = pd.to_datetime(bt_a1["date_dt"])
         w_a1 = pd.read_csv(w_a1_path)
-        sel = None  # not needed downstream
+
+        sel_payload = _load_selected_params(out_dir)
+        if sel_payload is not None:
+            from optimizer import SelectedParams
+            sel = SelectedParams(
+                lambda0=sel_payload["lambda0"],
+                lambda2=sel_payload["lambda2"],
+                k=sel_payload["k"],
+                val_sharpe=sel_payload["val_sharpe"],
+            )
     else:
         print("\n[A1] AP-pruning static, no TC...", flush=True)
         bt_a1, w_a1, diag_a1, sel = ap_pruning_static_optimize(
-            tilted_returns,
+            candidate_returns,
             n_train_valid=N_TRAIN_VALID,
             cv_n=CV_N,
             lambda0_grid=AP_LAMBDA0_GRID,
@@ -224,67 +242,84 @@ def main() -> None:
             port_n=AP_PORT_N,
             kmin=AP_K_MIN,
             kmax=AP_K_MAX,
-            method_name="AP-Trees AP-pruning (static, no TC)",
+            method_name="AP-Trees baseline (static, no TC)",
             cost_per_turnover=0.0,
             stock_weights=stock_weights_path,
             use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
             rf=rf_series,
         )
+
         print(f"Selected AP-pruning params: {sel}", flush=True)
+
         bt_a1.to_csv(a1_path, index=False)
         w_a1.to_csv(w_a1_path, index=False)
-        diag_a1.to_csv(out_dir / "diagnostics_A1_ap_pruning_static_no_tc.csv", index=False)
+        diag_a1.to_csv(diag_a1_path, index=False)
+        _save_selected_params(out_dir, sel)
 
     selected_candidates = w_a1["candidate"].tolist()
 
     # ============================================================
     # A2: same AP-pruning selection, stock-level TC ex-post
-    # (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to force re-run)
     # ============================================================
-    a2_path = out_dir / "backtest_A2_ap_pruning_static_stock_level_tc.csv"
+    a2_path = out_dir / "backtest_A2_static_stock_level_tc.csv"
+    w_a2_path = out_dir / "weights_A2_static_stock_level_tc.csv"
+    diag_a2_path = out_dir / "diagnostics_A2_static_stock_level_tc.csv"
 
     if a2_path.exists():
-        print("\n[A2] Loading from checkpoint (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to re-run)...", flush=True)
+        print(
+            "\n[A2] Loading from checkpoint "
+            "(delete backtest_A2_static_stock_level_tc.csv to re-run)...",
+            flush=True,
+        )
         bt_a2 = pd.read_csv(a2_path)
         bt_a2["date_dt"] = pd.to_datetime(bt_a2["date_dt"])
     else:
+        if sel is None:
+            raise RuntimeError(
+                "A2 needs A1 selected params to reuse the same AP-pruning selection. "
+                "Delete A1/A2 checkpoint files and rerun, or make sure "
+                "selected_params_A1_static_no_tc.json exists."
+            )
+
         print("\n[A2] Same AP-pruning selection, stock-level TC ex-post...", flush=True)
-        # Use full grid if sel is None (A1 was loaded from checkpoint)
-        l0_grid = [sel.lambda0] if sel is not None else AP_LAMBDA0_GRID
-        l2_grid = [sel.lambda2] if sel is not None else AP_LAMBDA2_GRID
         bt_a2, w_a2, diag_a2, _ = ap_pruning_static_optimize(
-            tilted_returns,
+            candidate_returns,
             n_train_valid=N_TRAIN_VALID,
             cv_n=CV_N,
-            lambda0_grid=l0_grid,
-            lambda2_grid=l2_grid,
+            lambda0_grid=[sel.lambda0],
+            lambda2_grid=[sel.lambda2],
             port_n=AP_PORT_N,
-            kmin=AP_K_MIN,
-            kmax=AP_K_MAX,
-            method_name="AP-Trees AP-pruning (static + stock-level TC)",
+            kmin=sel.k,
+            kmax=sel.k,
+            method_name="AP-Trees static + stock-level TC",
             cost_per_turnover=TC_COST,
             stock_weights=stock_weights_path,
             use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
             rf=rf_series,
         )
+
         bt_a2.to_csv(a2_path, index=False)
-        w_a2.to_csv(out_dir / "weights_A2_ap_pruning_static_stock_level_tc.csv", index=False)
-        diag_a2.to_csv(out_dir / "diagnostics_A2_ap_pruning_static_stock_level_tc.csv", index=False)
+        w_a2.to_csv(w_a2_path, index=False)
+        diag_a2.to_csv(diag_a2_path, index=False)
 
     # ============================================================
     # B: rolling TC-aware, portfolio-level turnover
-    # (delete backtest_B_rolling_tc_portfolio_level_tc.csv to force re-run)
     # ============================================================
     b_path = out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv"
+    w_b_path = out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv"
 
     if b_path.exists():
-        print("\n[B] Loading from checkpoint (delete backtest_B_rolling_tc_portfolio_level_tc.csv to re-run)...", flush=True)
+        print(
+            "\n[B] Loading from checkpoint "
+            "(delete backtest_B_rolling_tc_portfolio_level_tc.csv to re-run)...",
+            flush=True,
+        )
         bt_b = pd.read_csv(b_path)
         bt_b["date_dt"] = pd.to_datetime(bt_b["date_dt"])
     else:
         print("\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
         bt_b, w_b = rolling_tc_optimize(
-            tilted_returns,
+            candidate_returns,
             window=ROLLING_WINDOW,
             lambda_l2=TC_LAMBDA_L2,
             lambda_tc=TC_LAMBDA_TC,
@@ -297,23 +332,28 @@ def main() -> None:
             long_only=TC_LONG_ONLY,
             rf=rf_series,
         )
+
         bt_b.to_csv(b_path, index=False)
-        w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
+        w_b.to_csv(w_b_path, index=False)
 
     # ============================================================
     # C: rolling TC-aware, stock-level turnover
-    # (delete backtest_C_rolling_tc_stock_level_tc.csv to force re-run)
     # ============================================================
     c_path = out_dir / "backtest_C_rolling_tc_stock_level_tc.csv"
+    w_c_path = out_dir / "weights_C_rolling_tc_stock_level_tc.csv"
 
     if c_path.exists():
-        print("\n[C] Loading from checkpoint (delete backtest_C_rolling_tc_stock_level_tc.csv to re-run)...", flush=True)
+        print(
+            "\n[C] Loading from checkpoint "
+            "(delete backtest_C_rolling_tc_stock_level_tc.csv to re-run)...",
+            flush=True,
+        )
         bt_c = pd.read_csv(c_path)
         bt_c["date_dt"] = pd.to_datetime(bt_c["date_dt"])
     else:
         print("\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
         bt_c, w_c = rolling_tc_optimize(
-            tilted_returns,
+            candidate_returns,
             window=ROLLING_WINDOW,
             lambda_l2=TC_LAMBDA_L2,
             lambda_tc=TC_LAMBDA_TC,
@@ -326,8 +366,9 @@ def main() -> None:
             long_only=TC_LONG_ONLY,
             rf=rf_series,
         )
+
         bt_c.to_csv(c_path, index=False)
-        w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)
+        w_c.to_csv(w_c_path, index=False)
 
     # ============================================================
     # Align dates + benchmark + combined outputs

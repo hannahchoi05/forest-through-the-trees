@@ -12,7 +12,7 @@ except ImportError:
     lars_path = None
 
 
-STATIC_TURNOVER_PROXY = 0.05
+
 
 
 # ============================================================
@@ -594,7 +594,7 @@ def ap_pruning_static_optimize(
             turnover = _stock_turnover(curr_stock_w, prev_stock_w)
             prev_stock_w = curr_stock_w
         else:
-            turnover = STATIC_TURNOVER_PROXY
+            turnover = 0.0
 
         turnovers.append(turnover)
         costs.append(turnover * cost_per_turnover)
@@ -768,6 +768,7 @@ def rolling_tc_optimize(
     stock_weights=None,
     selected_candidates: list[str] | None = None,
     long_only: bool = False,
+    rf: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Rolling transaction-cost-aware ablation.
@@ -792,7 +793,21 @@ def rolling_tc_optimize(
         if not cols:
             raise ValueError("No selected candidates exist in returns_df.")
 
-    x = df[cols].astype(float).fillna(0.0).reset_index(drop=True)
+    x_raw = df[cols].astype(float).fillna(0.0).reset_index(drop=True)
+
+    # Subtract rf for mu/sigma estimation (matches static optimizer convention).
+    # Gross returns use raw x so wealth plots are correct.
+    if rf is not None:
+        rf_arr = np.asarray(rf, dtype=float).flatten()
+        n = len(x_raw)
+        if len(rf_arr) >= n:
+            rf_arr = rf_arr[:n]
+        else:
+            rf_arr = np.concatenate([rf_arr, np.zeros(n - len(rf_arr))])
+        x = x_raw.subtract(pd.Series(rf_arr, index=x_raw.index), axis=0)
+    else:
+        x = x_raw
+
     meta_cols = _meta_cols(df)
 
     k = len(cols)
@@ -842,7 +857,7 @@ def rolling_tc_optimize(
             prev_stock_vec=prev_stock_vec,
         )
 
-        gross = float(x.iloc[t].to_numpy() @ w)
+        gross = float(x_raw.iloc[t].to_numpy() @ w)
         raw_turnover = float(np.sum(np.abs(w - w_prev)))
         candidate_w = pd.Series(w, index=cols)
 

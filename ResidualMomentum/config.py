@@ -24,14 +24,15 @@ N_TRAIN_VALID = 360
 CV_N = 3
 ROLLING_WINDOW = 120
 
-AP_LAMBDA0_GRID = [0.0, 0.5, 1.0, 2.0, 5.0]
-AP_LAMBDA2_GRID = [1e-5, 1e-4, 1e-3, 1e-2]
+import numpy as np
+AP_LAMBDA0_GRID = list(np.round(np.arange(0.0, 0.95, 0.05), 10))  # 19 values {0, 0.05, ..., 0.90}
+AP_LAMBDA2_GRID = list(np.logspace(-5.0, -8.0, 13))                 # 13 log-spaced values 10^{-5} to 10^{-8}
 AP_K_MIN = 5
 AP_K_MAX = 50
 AP_PORT_N = 40
 
 TC_COST = 0.0025
-TC_LAMBDA_L2 = 1e-3
+TC_LAMBDA_L2 = 1e-6
 TC_LAMBDA_TC = 0.0025
 TC_ETA = 1.0
 TC_LONG_ONLY = False

@@ -75,7 +75,7 @@ def _load_rf(factor_dir) -> np.ndarray | None:
     rf_raw = pd.read_csv(rf_path, header=None).squeeze().astype(float).to_numpy()
 
     # Detect if already in decimal form (median absolute value << 0.01 means decimal)
-    if float(np.median(np.abs(rf_raw))) < 0.01::
+    if float(np.median(np.abs(rf_raw))) < 0.01:
         print(
             f"Loaded rf series ({len(rf_raw)} months) — values appear already in "
             "decimal form, using as-is.",
@@ -176,6 +176,7 @@ def _run_optimization_and_backtests(
         stock_weights=None,
         selected_candidates=selected_candidates,
         long_only=TC_LONG_ONLY,
+        rf=rf,
     )
 
     bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
@@ -194,6 +195,7 @@ def _run_optimization_and_backtests(
         stock_weights=stock_weights_path,
         selected_candidates=selected_candidates,
         long_only=TC_LONG_ONLY,
+        rf=rf,
     )
 
     bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv", index=False)

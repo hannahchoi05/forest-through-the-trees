@@ -21,8 +21,11 @@ from config import (  # noqa: E402
     DEFAULT_Y_MAX,
     N_TRAIN_VALID,
     CV_N,
-    STATIC_LAMBDA_L2,
-    STATIC_MU0,
+    STATIC_MU0_GRID,
+    STATIC_LAMBDA_L2_GRID,
+    STATIC_K,
+    STATIC_K_MIN,
+    STATIC_K_MAX,
     LONG_ONLY,
     ROLLING_WINDOW,
     TC_COST,
@@ -61,51 +64,53 @@ def main() -> None:
     print("Loading stock-month panel for stock-level turnover...", flush=True)
     panel = load_yearly_chunks(CHUNK_DIR, chars, DEFAULT_Y_MIN, DEFAULT_Y_MAX)
 
-    # ---------------------------------------------------------------------
-    # A1: Static optimizer, no transaction costs.
-    # ---------------------------------------------------------------------
-    print("Running Triple Sort static optimizer (no TC)...", flush=True)
+    # -------------------------------------------------------------------------
+    # A1: LARS-based AP-Pruning, no transaction costs.
+    #     Grid-searches (mu0, lambda_l2) on validation window.
+    # -------------------------------------------------------------------------
+    print("Running Triple Sort LARS optimizer (no TC) — grid search...", flush=True)
     bt_a1, w_a1, diag_a1 = static_paper_style_optimize(
         returns,
         n_train_valid=N_TRAIN_VALID,
         panel=None,
         n_bins=DEFAULT_N_BINS,
         cv_n=CV_N,
-        lambda_l2=STATIC_LAMBDA_L2,
-        mu0=STATIC_MU0,
         long_only=LONG_ONLY,
         method_name="Triple Sort static (no TC)",
         cost_per_turnover=0.0,
         use_stock_level_turnover=False,
+        mu0_grid=STATIC_MU0_GRID,
+        lambda_l2_grid=STATIC_LAMBDA_L2_GRID,
+        k_target=STATIC_K,
+        k_min=STATIC_K_MIN,
+        k_max=STATIC_K_MAX,
     )
 
-    # Legacy outputs (backtest_triplesort_* / diagnostics_triplesort_* / weights_triplesort_*)
-    # are no longer emitted; keep only canonical A1/A2/B/C + comparison outputs.
-
-    # ---------------------------------------------------------------------
-    # A2: Static optimizer with stock-level transaction costs.
-    # ---------------------------------------------------------------------
-    print("Running Triple Sort static optimizer (stock-level TC)...", flush=True)
+    # -------------------------------------------------------------------------
+    # A2: Same LARS weights, stock-level TC applied ex-post.
+    # -------------------------------------------------------------------------
+    print("Running Triple Sort LARS optimizer (stock-level TC)...", flush=True)
     bt_a2, w_a2, diag_a2 = static_paper_style_optimize(
         returns,
         n_train_valid=N_TRAIN_VALID,
         panel=panel,
         n_bins=DEFAULT_N_BINS,
         cv_n=CV_N,
-        lambda_l2=STATIC_LAMBDA_L2,
-        mu0=STATIC_MU0,
         long_only=LONG_ONLY,
         method_name="Triple Sort static + stock-level TC",
         cost_per_turnover=TC_COST,
         use_stock_level_turnover=True,
+        mu0_grid=STATIC_MU0_GRID,
+        lambda_l2_grid=STATIC_LAMBDA_L2_GRID,
+        k_target=STATIC_K,
+        k_min=STATIC_K_MIN,
+        k_max=STATIC_K_MAX,
     )
 
-    # (weights are not emitted by default to avoid clutter)
-
-    # ---------------------------------------------------------------------
-    # B: Rolling TC-aware optimizer with portfolio-level turnover costs.
-    # ---------------------------------------------------------------------
-    print("Running Triple Sort rolling TC-aware optimizer (portfolio-level TC)...", flush=True)
+    # -------------------------------------------------------------------------
+    # B: Rolling TC-aware, portfolio-level turnover in objective.
+    # -------------------------------------------------------------------------
+    print("Running Triple Sort rolling TC-aware (portfolio-level TC)...", flush=True)
     bt_b, w_b = rolling_tc_optimize(
         returns,
         window=ROLLING_WINDOW,
@@ -120,12 +125,10 @@ def main() -> None:
         turnover_mode="portfolio",
     )
 
-    # (rolling weights not emitted by default)
-
-    # ---------------------------------------------------------------------
-    # C: Rolling TC-aware optimizer with stock-level turnover costs.
-    # ---------------------------------------------------------------------
-    print("Running Triple Sort rolling TC-aware optimizer (stock-level TC)...", flush=True)
+    # -------------------------------------------------------------------------
+    # C: Rolling TC-aware, stock-level turnover in objective.
+    # -------------------------------------------------------------------------
+    print("Running Triple Sort rolling TC-aware (stock-level TC)...", flush=True)
     bt_c, w_c = rolling_tc_optimize(
         returns,
         window=ROLLING_WINDOW,
@@ -140,45 +143,40 @@ def main() -> None:
         turnover_mode="stock",
     )
 
-    # (rolling weights not emitted by default)
-
-    # ---------------------------------------------------------------------
-    # Write residual_momentum-style filenames (A1/A2/B/C).
-    # ---------------------------------------------------------------------
-    bt_a1.to_csv(out_dir / "backtest_A1_triple_sort_static_no_tc.csv", index=False)
-    diag_a1.to_csv(out_dir / "diagnostics_A1_triple_sort_static_no_tc.csv", index=False)
-
-    bt_a2.to_csv(out_dir / "backtest_A2_triple_sort_static_stock_level_tc.csv", index=False)
+    # -------------------------------------------------------------------------
+    # Write individual A1/A2/B/C files.
+    # -------------------------------------------------------------------------
+    bt_a1.to_csv(out_dir / "backtest_A1_triple_sort_static_no_tc.csv",               index=False)
+    diag_a1.to_csv(out_dir / "diagnostics_A1_triple_sort_static_no_tc.csv",          index=False)
+    bt_a2.to_csv(out_dir / "backtest_A2_triple_sort_static_stock_level_tc.csv",       index=False)
     diag_a2.to_csv(out_dir / "diagnostics_A2_triple_sort_static_stock_level_tc.csv", index=False)
+    bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv",             index=False)
+    bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv",                 index=False)
 
-    bt_b.to_csv(out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv", index=False)
-    bt_c.to_csv(out_dir / "backtest_C_rolling_tc_stock_level_tc.csv", index=False)
-
-    # ---------------------------------------------------------------------
-    # Align all variants to a common calendar sample and write comparison.
-    # ---------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Align all variants to common calendar and write comparison.
+    # -------------------------------------------------------------------------
     common_start = max(
-        bt_a1["date_dt"].min(),
-        bt_a2["date_dt"].min(),
-        bt_b["date_dt"].min(),
-        bt_c["date_dt"].min(),
+        bt_a1["date_dt"].min(), bt_a2["date_dt"].min(),
+        bt_b["date_dt"].min(),  bt_c["date_dt"].min(),
     )
     common_end = min(
-        bt_a1["date_dt"].max(),
-        bt_a2["date_dt"].max(),
-        bt_b["date_dt"].max(),
-        bt_c["date_dt"].max(),
+        bt_a1["date_dt"].max(), bt_a2["date_dt"].max(),
+        bt_b["date_dt"].max(),  bt_c["date_dt"].max(),
     )
 
-    bt_a1 = bt_a1[(bt_a1["date_dt"] >= common_start) & (bt_a1["date_dt"] <= common_end)].copy()
-    bt_a2 = bt_a2[(bt_a2["date_dt"] >= common_start) & (bt_a2["date_dt"] <= common_end)].copy()
-    bt_b = bt_b[(bt_b["date_dt"] >= common_start) & (bt_b["date_dt"] <= common_end)].copy()
-    bt_c = bt_c[(bt_c["date_dt"] >= common_start) & (bt_c["date_dt"] <= common_end)].copy()
+    def _trim(bt: pd.DataFrame) -> pd.DataFrame:
+        return bt[
+            (bt["date_dt"] >= common_start) & (bt["date_dt"] <= common_end)
+        ].copy()
 
+    bt_a1 = _trim(bt_a1)
+    bt_a2 = _trim(bt_a2)
+    bt_b  = _trim(bt_b)
+    bt_c  = _trim(bt_c)
     pieces = [bt_a1, bt_a2, bt_b, bt_c]
 
-    # Add S&P 500 benchmark from Yahoo Finance (adjusted close).
-    # No proxy fallback; if Yahoo fails, continue without the benchmark (residual_momentum behavior).
+    # S&P 500 benchmark from Yahoo Finance.
     try:
         bt_sp = load_yahoo_monthly_benchmark(
             ticker="SPY",
@@ -200,28 +198,17 @@ def main() -> None:
 
     metrics = performance_metrics(backtest)
     ordered_cols = [
-        "method",
-        "n_months",
-        "start_date",
-        "end_date",
-        "mean_gross_monthly",
-        "mean_net_monthly",
-        "mean_gross_ann",
-        "mean_net_ann",
-        "vol_gross_monthly",
-        "vol_net_monthly",
-        "vol_gross_ann",
-        "vol_net_ann",
-        "sharpe_gross_ann",
-        "sharpe_net_ann",
+        "method", "n_months", "start_date", "end_date",
+        "mean_gross_monthly", "mean_net_monthly",
+        "mean_gross_ann", "mean_net_ann",
+        "vol_gross_monthly", "vol_net_monthly",
+        "vol_gross_ann", "vol_net_ann",
+        "sharpe_gross_ann", "sharpe_net_ann",
         "sharpe_decay_due_to_costs",
-        "hit_rate_gross",
-        "hit_rate_net",
-        "avg_turnover",
-        "avg_cost",
+        "hit_rate_gross", "hit_rate_net",
+        "avg_turnover", "avg_cost",
         "max_drawdown_net",
-        "terminal_wealth_gross",
-        "terminal_wealth_net",
+        "terminal_wealth_gross", "terminal_wealth_net",
     ]
     metrics = metrics[[c for c in ordered_cols if c in metrics.columns]]
     metrics.to_csv(out_dir / "summary_metrics_comparison.csv", index=False)

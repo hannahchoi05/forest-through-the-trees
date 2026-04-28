@@ -228,12 +228,14 @@ def _ap_prune(
         if w is None:
             w = coef_path[:, -1].copy()
 
-        # Long-only + normalize (paper uses long-only investment strategies)
-        w = np.maximum(w, 0.0)
-        total = w.sum()
-        if total < 1e-12:
+        # Normalize by abs(sum(w)) — matches R's b = b / abs(sum(b)).
+        # Do NOT clip to zero: LARS SDF weights can be negative (short positions
+        # in the portfolio combination). The underlying sorted portfolios are
+        # long-only by construction; the SDF weights combining them are not.
+        denom = abs(float(w.sum()))
+        if denom < 1e-12:
             continue
-        results[K] = w / total
+        results[K] = w / denom
 
     return results
 
@@ -321,8 +323,13 @@ def ap_pruning_static_optimize(
     )
     final_w = k_weights_full[best_sel.k] if best_sel.k in k_weights_full else best_w
 
-    # Test-period gross returns
-    gross = x_te @ final_w
+    # Test-period gross returns — use RAW (unscaled, with rf) portfolio returns.
+    # Depth-scaling and rf subtraction are only for estimation (mu/sigma/LARS).
+    # Matching R: sdf_ret = ports %*% (b / adj_w), where b already has adj_w
+    # baked in, so b / adj_w removes the scaling → raw port returns.
+    # For the backtest wealth series we use raw returns so $1 grows correctly.
+    x_raw_te = x_raw[n_train_valid:]
+    gross = x_raw_te @ final_w
 
     # Transaction costs
     result = df.iloc[n_train_valid:][meta_c].copy().reset_index(drop=True)
@@ -510,7 +517,9 @@ def rolling_tc_optimize(
         w = np.clip(w, 0.0, None) if long_only else w
         w = w / w.sum() if w.sum() > 1e-12 else x0
 
-        gross = float(x_scaled[t] @ w)
+        # Use raw (unscaled, with rf included) returns for backtest gross return.
+        # x_scaled is only for estimation; wealth plots must use raw port returns.
+        gross = float(x_raw[t] @ w)
         raw_to = float(np.sum(np.abs(w - w_prev)))
 
         # Always compute stock-level turnover when basis is available

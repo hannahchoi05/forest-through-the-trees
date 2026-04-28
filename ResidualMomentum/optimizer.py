@@ -684,10 +684,16 @@ def solve_tc_mean_variance_qp(
     prev_stock_vec: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Ablation objective:
-        min_w 0.5 w'Sigma w - eta mu'w + 0.5 lambda2 ||w||_2^2 + lambda_tc * turnover
+    Trading extension objective:
+        min_w 0.5 w'Sigma w - eta mu'w
+              + 0.5 lambda2 ||w||_2^2
+              + lambda_tc * turnover
 
-    Returned weights are gross-exposure-normalized for stable investable backtests.
+    If long_only=True:
+        sum(w)=1, w>=0
+
+    If long_only=False:
+        sum(abs(w))=1, negative weights allowed.
     """
     mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
@@ -701,10 +707,11 @@ def solve_tc_mean_variance_qp(
 
     if turnover_mode == "stock" and stock_matrix is not None and stock_matrix.size > 0:
         M = np.asarray(stock_matrix, dtype=float)
-        if prev_stock_vec is None:
-            prev_stock_vec = np.zeros(M.shape[0])
-        else:
-            prev_stock_vec = np.asarray(prev_stock_vec, dtype=float)
+        prev_stock_vec = (
+            np.zeros(M.shape[0])
+            if prev_stock_vec is None
+            else np.asarray(prev_stock_vec, dtype=float)
+        )
 
         def tc_penalty(w: np.ndarray) -> float:
             return float(np.sum(np.abs(M @ w - prev_stock_vec)))
@@ -720,20 +727,17 @@ def solve_tc_mean_variance_qp(
             + lambda_tc * tc_penalty(w)
         )
 
-    # For the extension we constrain net budget. Gross exposure is normalized after solve.
-    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
     if long_only:
-        bounds = [(0.0, 1.0) for _ in range(k)]
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+        bounds = [(0.0, 1.0)] * k
         x0 = np.clip(w_prev, 0.0, 1.0)
+        x0 = x0 / x0.sum() if abs(x0.sum()) > 1e-12 else np.ones(k) / k
     else:
-        bounds = [(-1.0, 1.0) for _ in range(k)]
-        x0 = w_prev.copy()
-
-    if abs(x0.sum()) <= 1e-12:
-        x0 = np.ones(k) / k
-    else:
-        x0 = x0 / x0.sum()
+        constraints = [{"type": "eq", "fun": lambda w: np.sum(np.abs(w)) - 1.0}]
+        bounds = [(-1.0, 1.0)] * k
+        x0 = _normalize_gross_exposure(w_prev)
+        if np.sum(np.abs(x0)) < 1e-12:
+            x0 = np.ones(k) / k
 
     res = minimize(
         obj,
@@ -741,18 +745,19 @@ def solve_tc_mean_variance_qp(
         method="SLSQP",
         bounds=bounds,
         constraints=constraints,
-        options={"maxiter": 500, "ftol": 1e-9, "disp": False},
+        options={"maxiter": 1000, "ftol": 1e-10, "disp": False},
     )
 
-    if not res.success:
-        # Freeze previous portfolio instead of resetting to equal weights.
-        return _normalize_gross_exposure(w_prev)
+    if not res.success or np.any(~np.isfinite(res.x)):
+        return x0
 
     w = np.asarray(res.x, dtype=float)
-    if np.any(~np.isfinite(w)):
-        return _normalize_gross_exposure(w_prev)
-
     w[np.abs(w) < 1e-12] = 0.0
+
+    if long_only:
+        w = np.clip(w, 0.0, None)
+        return w / w.sum() if abs(w.sum()) > 1e-12 else np.ones(k) / k
+
     return _normalize_gross_exposure(w)
 
 

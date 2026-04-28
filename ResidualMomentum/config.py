@@ -25,16 +25,17 @@ CV_N = 3
 ROLLING_WINDOW = 120
 
 import numpy as np
-AP_LAMBDA0_GRID = list(np.round(np.arange(0.0, 0.95, 0.05), 10))  # 19 values {0, 0.05, ..., 0.90}
-AP_LAMBDA2_GRID = list(np.logspace(-5.0, -8.0, 13))                 # 13 log-spaced values 10^{-5} to 10^{-8}
+
+AP_LAMBDA0_GRID = list(np.round(np.arange(0.0, 0.95, 0.05), 10))
+AP_LAMBDA2_GRID = list(np.logspace(-5.0, -8.0, 13))
 AP_K_MIN = 5
 AP_K_MAX = 50
 AP_PORT_N = 40
 
 TC_COST = 0.0025
-TC_LAMBDA_L2 = 1e-6
+TC_LAMBDA_L2 = 1e-2
 TC_LAMBDA_TC = 0.0025
-TC_ETA = 1.0
+TC_ETA = 0.15
 TC_LONG_ONLY = False
 
 USE_STOCK_LEVEL_TURNOVER = True

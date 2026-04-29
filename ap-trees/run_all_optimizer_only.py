@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+from config import (
+    CHUNK_DIR,
+    OUTPUT_DIR,
+    FACTOR_DIR,
+    DEFAULT_CHARS,
+    DEFAULT_TAU,
+    DEFAULT_Y_MIN,
+    DEFAULT_Y_MAX,
+    N_TRAIN_VALID,
+    CV_N,
+    ROLLING_WINDOW,
+    TC_COST,
+    TC_LAMBDA_L2,
+    TC_LAMBDA_TC,
+    USE_STOCK_LEVEL_TURNOVER,
+    AP_LAMBDA0_GRID,
+    AP_LAMBDA2_GRID,
+    AP_K_MIN,
+    AP_K_MAX,
+    AP_PORT_N,
+    TC_ETA,
+    TC_LONG_ONLY,
+)
+from data_io import load_yahoo_monthly_benchmark, load_yearly_chunks
+from optimizer import ap_pruning_static_optimize, rolling_tc_optimize
+from metrics import performance_metrics, add_wealth_drawdown
+from plots import make_all_plots
+
+
+def _load_rf() -> np.ndarray | None:
+    """
+    Load monthly risk-free rates from rf_factor.csv and convert to decimal.
+
+    R Step3_RmRf_Combine_Trees.R does:
+        port_ret[,i] = port_ret[,i] - (rf)/100
+    meaning rf_factor.csv stores values as percentage points (e.g. 0.45
+    means 0.45% per month). We divide by 100 here to match that convention.
+    """
+    rf_path = FACTOR_DIR / "rf_factor.csv"
+
+    if not rf_path.exists():
+        print(
+            f"WARNING: rf_factor.csv not found at {rf_path}. "
+            "Using raw returns instead of excess returns.",
+            flush=True,
+        )
+        return None
+
+    rf_raw = pd.read_csv(rf_path, header=None).squeeze().astype(float).to_numpy()
+
+    # Detect if already in decimal form (median absolute value << 0.01 means decimal)
+    if float(np.median(np.abs(rf_raw))) < 0.01:
+        print(
+            f"Loaded rf series ({len(rf_raw)} months) — values appear already in "
+            "decimal form, using as-is.",
+            flush=True,
+        )
+        return rf_raw
+    else:
+        print(
+            f"Loaded rf series ({len(rf_raw)} months) — dividing by 100 to convert "
+            "from percentage points to decimal.",
+            flush=True,
+        )
+        return rf_raw / 100.0
+
+
+def _align_to_common_window(dfs: list[pd.DataFrame]) -> list[pd.DataFrame]:
+    common_start = max(df["date_dt"].min() for df in dfs)
+    common_end = min(df["date_dt"].max() for df in dfs)
+
+    out = []
+    for df in dfs:
+        out.append(
+            df[
+                (df["date_dt"] >= common_start)
+                & (df["date_dt"] <= common_end)
+            ].copy()
+        )
+
+    print(f"Common test window: {common_start.date()} to {common_end.date()}", flush=True)
+    return out
+
+
+def _restore_candidate_matrix_from_stock_weights(
+    candidate_path,
+    stock_weights_path,
+    chars: list[str],
+) -> pd.DataFrame:
+    """
+    Rebuild ap_tree_candidate_matrix.csv from streamed monthly stock weights.
+
+    This is much cheaper than rebuilding the full AP-tree set because the node
+    membership and within-node weights have already been checkpointed to disk.
+    """
+    files = sorted(stock_weights_path.glob("*.pkl"))
+    if not files:
+        raise FileNotFoundError(
+            f"Missing stock-weight checkpoint files in {stock_weights_path}."
+        )
+
+    print(
+        f"Candidate matrix missing. Reconstructing from {len(files)} monthly stock-weight files...",
+        flush=True,
+    )
+
+    panel = load_yearly_chunks(CHUNK_DIR, chars, DEFAULT_Y_MIN, DEFAULT_Y_MAX)[
+        ["date", "date_dt", "yy", "mm", "permno", "ret"]
+    ].copy()
+    panel["permno"] = panel["permno"].astype(str)
+
+    month_returns = {
+        key: grp[["permno", "ret"]].set_index("permno")["ret"]
+        for key, grp in panel.groupby(["yy", "mm"], sort=True)
+    }
+    month_meta = (
+        panel[["date", "date_dt", "yy", "mm"]]
+        .drop_duplicates(subset=["yy", "mm"])
+        .sort_values(["yy", "mm"])
+        .set_index(["yy", "mm"])
+    )
+
+    rows = []
+
+    for idx, path in enumerate(files, start=1):
+        yy = int(path.stem.split("_")[0])
+        mm = int(path.stem.split("_")[1])
+
+        if idx == 1 or idx % 25 == 0:
+            print(
+                f"  Restoring candidate matrix month {idx}/{len(files)} ({yy}-{mm:02d})",
+                flush=True,
+            )
+
+        if (yy, mm) not in month_returns:
+            continue
+
+        sw = pd.read_pickle(path, compression="gzip")
+        sw["permno"] = sw["permno"].astype(str)
+        sw["ret"] = sw["permno"].map(month_returns[(yy, mm)]).fillna(0.0)
+        sw["weighted_ret"] = sw["base_stock_w"].astype(float) * sw["ret"].astype(float)
+
+        port_ret = sw.groupby("node_id", sort=False)["weighted_ret"].sum()
+        meta = month_meta.loc[(yy, mm)]
+        row = {
+            "date": int(meta["date"]),
+            "date_dt": pd.to_datetime(meta["date_dt"]),
+            "yy": yy,
+            "mm": mm,
+        }
+        row.update({f"port_{node_id}": value for node_id, value in port_ret.items()})
+        rows.append(row)
+
+    if not rows:
+        raise ValueError("Unable to reconstruct any candidate-matrix rows from stock weights.")
+
+    out = pd.DataFrame(rows).sort_values(["yy", "mm"]).reset_index(drop=True)
+    out.to_csv(candidate_path, index=False)
+    print(f"Restored candidate matrix: {candidate_path}", flush=True)
+    return out
+
+
+def main() -> None:
+    chars = DEFAULT_CHARS
+    subdir = "_".join(chars)
+
+    out_dir = OUTPUT_DIR / subdir
+    plot_dir = out_dir / "plots"
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate_path = out_dir / "ap_tree_candidate_matrix.csv"
+    stock_weights_path = out_dir / "stock_weights_by_month"
+
+    if not stock_weights_path.exists():
+        raise FileNotFoundError(
+            f"Missing stock weights directory: {stock_weights_path}. "
+            "Run the full tree-building pipeline first."
+        )
+
+    # Load rf once here and pass it to both A1 and A2.
+    # Matches R Step3_RmRf_Combine_Trees.R which subtracts rf before AP-pruning.
+    rf_series = _load_rf()
+
+    if candidate_path.exists():
+        print(f"Loading existing candidate matrix: {candidate_path}", flush=True)
+        tilted_returns = pd.read_csv(candidate_path)
+        if "date_dt" in tilted_returns.columns:
+            tilted_returns["date_dt"] = pd.to_datetime(tilted_returns["date_dt"])
+    else:
+        tilted_returns = _restore_candidate_matrix_from_stock_weights(
+            candidate_path,
+            stock_weights_path,
+            chars,
+        )
+
+    # ============================================================
+    # A1: AP-pruning static, no TC
+    # (delete backtest_A1_ap_pruning_static_no_tc.csv to force re-run)
+    # ============================================================
+    a1_path = out_dir / "backtest_A1_ap_pruning_static_no_tc.csv"
+    w_a1_path = out_dir / "weights_A1_ap_pruning_static_no_tc.csv"
+
+    if a1_path.exists() and w_a1_path.exists():
+        print("\n[A1] Loading from checkpoint (delete backtest_A1_ap_pruning_static_no_tc.csv to re-run)...", flush=True)
+        bt_a1 = pd.read_csv(a1_path)
+        bt_a1["date_dt"] = pd.to_datetime(bt_a1["date_dt"])
+        w_a1 = pd.read_csv(w_a1_path)
+        sel = None  # not needed downstream
+    else:
+        print("\n[A1] AP-pruning static, no TC...", flush=True)
+        bt_a1, w_a1, diag_a1, sel = ap_pruning_static_optimize(
+            tilted_returns,
+            n_train_valid=N_TRAIN_VALID,
+            cv_n=CV_N,
+            lambda0_grid=AP_LAMBDA0_GRID,
+            lambda2_grid=AP_LAMBDA2_GRID,
+            port_n=AP_PORT_N,
+            kmin=AP_K_MIN,
+            kmax=AP_K_MAX,
+            method_name="AP-Trees AP-pruning (static, no TC)",
+            cost_per_turnover=0.0,
+            stock_weights=stock_weights_path,
+            use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
+            rf=rf_series,
+        )
+        print(f"Selected AP-pruning params: {sel}", flush=True)
+        bt_a1.to_csv(a1_path, index=False)
+        w_a1.to_csv(w_a1_path, index=False)
+        diag_a1.to_csv(out_dir / "diagnostics_A1_ap_pruning_static_no_tc.csv", index=False)
+
+    selected_candidates = w_a1["candidate"].tolist()
+
+    # ============================================================
+    # A2: same AP-pruning selection, stock-level TC ex-post
+    # (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to force re-run)
+    # ============================================================
+    a2_path = out_dir / "backtest_A2_ap_pruning_static_stock_level_tc.csv"
+
+    if a2_path.exists():
+        print("\n[A2] Loading from checkpoint (delete backtest_A2_ap_pruning_static_stock_level_tc.csv to re-run)...", flush=True)
+        bt_a2 = pd.read_csv(a2_path)
+        bt_a2["date_dt"] = pd.to_datetime(bt_a2["date_dt"])
+    else:
+        print("\n[A2] Same AP-pruning selection, stock-level TC ex-post...", flush=True)
+        # Use full grid if sel is None (A1 was loaded from checkpoint)
+        l0_grid = [sel.lambda0] if sel is not None else AP_LAMBDA0_GRID
+        l2_grid = [sel.lambda2] if sel is not None else AP_LAMBDA2_GRID
+        bt_a2, w_a2, diag_a2, _ = ap_pruning_static_optimize(
+            tilted_returns,
+            n_train_valid=N_TRAIN_VALID,
+            cv_n=CV_N,
+            lambda0_grid=l0_grid,
+            lambda2_grid=l2_grid,
+            port_n=AP_PORT_N,
+            kmin=AP_K_MIN,
+            kmax=AP_K_MAX,
+            method_name="AP-Trees AP-pruning (static + stock-level TC)",
+            cost_per_turnover=TC_COST,
+            stock_weights=stock_weights_path,
+            use_stock_level_turnover=USE_STOCK_LEVEL_TURNOVER,
+            rf=rf_series,
+        )
+        bt_a2.to_csv(a2_path, index=False)
+        w_a2.to_csv(out_dir / "weights_A2_ap_pruning_static_stock_level_tc.csv", index=False)
+        diag_a2.to_csv(out_dir / "diagnostics_A2_ap_pruning_static_stock_level_tc.csv", index=False)
+
+    # ============================================================
+    # B: rolling TC-aware, portfolio-level turnover
+    # (delete backtest_B_rolling_tc_portfolio_level_tc.csv to force re-run)
+    # ============================================================
+    b_path = out_dir / "backtest_B_rolling_tc_portfolio_level_tc.csv"
+
+    if b_path.exists():
+        print("\n[B] Loading from checkpoint (delete backtest_B_rolling_tc_portfolio_level_tc.csv to re-run)...", flush=True)
+        bt_b = pd.read_csv(b_path)
+        bt_b["date_dt"] = pd.to_datetime(bt_b["date_dt"])
+    else:
+        print("\n[B] TC-aware rolling ablation, portfolio-level turnover...", flush=True)
+        bt_b, w_b = rolling_tc_optimize(
+            tilted_returns,
+            window=ROLLING_WINDOW,
+            lambda_l2=TC_LAMBDA_L2,
+            lambda_tc=TC_LAMBDA_TC,
+            eta=TC_ETA,
+            cost_per_turnover=TC_COST,
+            method_name="AP-Trees rolling TC-aware (portfolio-level TC)",
+            turnover_mode="portfolio",
+            stock_weights=None,
+            selected_candidates=selected_candidates,
+            long_only=TC_LONG_ONLY,
+            rf=rf_series,
+        )
+        bt_b.to_csv(b_path, index=False)
+        w_b.to_csv(out_dir / "weights_B_rolling_tc_portfolio_level_tc.csv", index=False)
+
+    # ============================================================
+    # C: rolling TC-aware, stock-level turnover
+    # (delete backtest_C_rolling_tc_stock_level_tc.csv to force re-run)
+    # ============================================================
+    c_path = out_dir / "backtest_C_rolling_tc_stock_level_tc.csv"
+
+    if c_path.exists():
+        print("\n[C] Loading from checkpoint (delete backtest_C_rolling_tc_stock_level_tc.csv to re-run)...", flush=True)
+        bt_c = pd.read_csv(c_path)
+        bt_c["date_dt"] = pd.to_datetime(bt_c["date_dt"])
+    else:
+        print("\n[C] TC-aware rolling ablation, stock-level turnover...", flush=True)
+        bt_c, w_c = rolling_tc_optimize(
+            tilted_returns,
+            window=ROLLING_WINDOW,
+            lambda_l2=TC_LAMBDA_L2,
+            lambda_tc=TC_LAMBDA_TC,
+            eta=TC_ETA,
+            cost_per_turnover=TC_COST,
+            method_name="AP-Trees rolling TC-aware (stock-level TC)",
+            turnover_mode="stock",
+            stock_weights=stock_weights_path,
+            selected_candidates=selected_candidates,
+            long_only=TC_LONG_ONLY,
+            rf=rf_series,
+        )
+        bt_c.to_csv(c_path, index=False)
+        w_c.to_csv(out_dir / "weights_C_rolling_tc_stock_level_tc.csv", index=False)
+
+    # ============================================================
+    # Align dates + benchmark + combined outputs
+    # ============================================================
+    bt_a1, bt_a2, bt_b, bt_c = _align_to_common_window([bt_a1, bt_a2, bt_b, bt_c])
+
+    pieces = [bt_a1, bt_a2, bt_b, bt_c]
+
+    try:
+        print("\nLoading S&P 500 benchmark from Yahoo Finance using SPY...", flush=True)
+
+        common_start = bt_a1["date_dt"].min()
+        common_end = bt_a1["date_dt"].max()
+
+        bt_spy = load_yahoo_monthly_benchmark(
+            ticker="SPY",
+            start_date=common_start,
+            end_date=common_end,
+            method_name="S&P 500 (SPY adjusted close)",
+        )
+
+        bt_spy = bt_spy[bt_spy["date_dt"].isin(bt_a1["date_dt"])].copy()
+        pieces.append(bt_spy)
+
+    except Exception as e:
+        print(f"WARNING: Could not load SPY benchmark: {e}", flush=True)
+
+    backtest = pd.concat(pieces, ignore_index=True)
+    backtest = backtest.sort_values(["method", "yy", "mm"]).reset_index(drop=True)
+
+    backtest.to_csv(out_dir / "backtest_comparison.csv", index=False)
+
+    enriched = add_wealth_drawdown(backtest)
+    enriched.to_csv(out_dir / "backtest_comparison_with_wealth_drawdown.csv", index=False)
+
+    metrics = performance_metrics(backtest)
+    metrics.to_csv(out_dir / "summary_metrics_comparison.csv", index=False)
+
+    print("\nSummary metrics:", flush=True)
+    print(metrics.to_string(index=False), flush=True)
+
+    print("\nMaking plots...", flush=True)
+    make_all_plots(backtest, plot_dir)
+
+    print(f"\nDone. Outputs saved to: {out_dir}", flush=True)
+    print(f"Plots saved to: {plot_dir}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

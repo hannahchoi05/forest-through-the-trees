@@ -429,9 +429,9 @@ def plot_combined(bt_ts: pd.DataFrame, bt_ap: pd.DataFrame, bt_ap_rm: pd.DataFra
 
     pieces_raw = [ts, ap, ap_rm]
     labels_colors_raw = [
-        ("Triple Sort (best)", COLOR_TS),
-        ("AP-Trees (best)", COLOR_AP),
-        ("AP-Trees + RM (best)", COLOR_AP_RM),
+        ("Triple Sort (rolling TC-aware)", COLOR_TS),
+        ("AP-Trees (rolling TC-aware)", COLOR_AP),
+        ("AP-Trees + RM (rolling TC-aware)", COLOR_AP_RM),
     ]
 
     if not spy.empty:

@@ -29,8 +29,9 @@ from plot_figure_7 import plot_sr
 # backtest CSV correspond to which method. If your pipeline emits something
 # different — e.g. "AP-Trees baseline (static, no TC)" — update accordingly.
 METHOD_PATTERNS = {
-    "AP-Trees": "AP-Trees AP-pruning (static, no TC)",
-    "TS":       "Triple Sort static (no TC)",
+    "AP-Trees": "AP-Trees baseline (static, no TC)",
+    "TS32":     "Triple Sort (32) static (no TC)",
+    "TS64":     "Triple Sort (64) static (no TC)",
 }
 # === END EDIT ME =============================================================
 
@@ -83,7 +84,7 @@ def main():
         long_df,
         out_path=args.out_dir / "figure_7.png",
         sort_by_method="AP-Trees",
-        methods_to_plot=("AP-Trees", "TS"),
+        methods_to_plot=("AP-Trees", "TS32", "TS64"),
     )
 
 

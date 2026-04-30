@@ -19,19 +19,23 @@ import pandas as pd
 # ggplot2-style colors used in the paper, matched to method labels.
 _COLORS = {
     "AP-Trees": "#F8766D",   # red
-    "TS":       "#00BA38",   # green
+    "TS32":     "#00BA38",   # green
+    "TS64":     "#619CFF",   # blue
 }
 _LINESTYLES = {
     "AP-Trees": "solid",
-    "TS":       (0, (5, 2, 1, 2)),   # twodash-like
+    "TS32":     (0, (5, 2, 1, 2)),
+    "TS64":     (0, (3, 2)),
 }
 _MARKERS = {
     "AP-Trees": "o",
-    "TS":       "^",
+    "TS32":     "^",
+    "TS64":     "s",
 }
 _PRETTY_LABELS = {
     "AP-Trees": "AP-Trees",
-    "TS":       "Triple Sort",
+    "TS32":     "Triple Sort (32)",
+    "TS64":     "Triple Sort (64)",
 }
 
 
@@ -39,7 +43,7 @@ def plot_sr(
     long_df: pd.DataFrame,
     out_path: Path | str,
     sort_by_method: str = "AP-Trees",
-    methods_to_plot: tuple = ("AP-Trees", "TS"),
+    methods_to_plot: tuple = ("AP-Trees", "TS32", "TS64"),
     title: str | None = None,
 ):
     """

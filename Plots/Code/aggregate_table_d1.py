@@ -52,8 +52,9 @@ DEFAULT_TEST_END   = pd.Timestamp("2016-12-31")
 # actually emits. The aggregator will pick the row whose `method` column
 # *contains* the substring.
 DEFAULT_METHOD_PATTERNS = {
-    "AP-Trees": "AP-Trees AP-pruning (static, no TC)",   # variant A1, K=40
-    "TS":       "Triple Sort static (no TC)",       # extend pipeline to emit this
+    "AP-Trees": "AP-Trees baseline (static, no TC)",
+    "TS32":     "Triple Sort (32) static (no TC)",
+    "TS64":     "Triple Sort (64) static (no TC)",
 }
 
 

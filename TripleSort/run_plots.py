@@ -30,7 +30,7 @@ def main() -> None:
 
     # Enforce the new benchmark naming and avoid plotting stale proxy-series outputs.
     methods = set(backtest["method"].astype(str).unique()) if "method" in backtest else set()
-    want = "S&P 500 (adjusted close)"
+    want = "S&P 500 (SPY adjusted close)"
     proxy_markers = ("proxy", "Mkt-RF")
 
     if want not in methods:

@@ -176,40 +176,41 @@ def _ap_prune_lars(
     """
     Run LARS-based AP-Pruning for one (lambda_l2, lambda0) configuration.
 
-    Returns beta (LARS coefficients) at the step where sparsity == k_target,
-    or the closest step within [k_min, k_max].
+    This version uses the full-space design consistent with the R/paper notation:
 
-    Notes
-    -----
-    - lambda0 controls mean shrinkage toward cross-sectional average (Prop. 1).
-    - lambda_l2 folds into ridge augmentation of the LARS design matrix.
-    - lambda_l1 (LASSO) is implicit: determined by which LARS step we pick.
-    - Triple Sort has no depth adjustment, so adj_w = 1 throughout.
+        X = Sigma^{1/2} = V D^{1/2} V'
+        y = Sigma^{-1/2} mu_shrunk = V D^{-1/2} V' mu_shrunk
+
+    Then ridge is folded in by _lars_path through:
+
+        X_aug = [X; sqrt(lambda_l2) I]
+        y_aug = [y; 0]
     """
     mu = np.asarray(mu, dtype=float)
     sigma = np.asarray(sigma, dtype=float)
     p = len(mu)
 
-    # --- Mean shrinkage (Proposition 1) ---
+    # --- Mean shrinkage ---
     mu_bar = float(mu.mean())
     mu_shrunk = mu + lambda0 * mu_bar * np.ones(p)
 
-    # --- Eigendecomposition (Appendix A.4) ---
-    V, D = _eig_decomp(sigma)           # V: (p, r), D: (r,) descending
-    D_sqrt = np.sqrt(D)                  # D^{1/2}
-    D_inv_sqrt = 1.0 / D_sqrt           # D^{-1/2}
+    # --- Eigendecomposition ---
+    V, D = _eig_decomp(sigma)
+    if len(D) == 0:
+        return np.zeros(p)
 
-    # Σ̃ = V D^{1/2} V'  — used as the design matrix X in LARS
-    Sigma_tilde = V * D_sqrt[np.newaxis, :]   # (p, r)  = V @ diag(D^{1/2})
+    D_sqrt = np.sqrt(D)
+    D_inv_sqrt = 1.0 / D_sqrt
 
-    # μ̃_tilde = V D^{-1/2} V' μ_shrunk
-    mu_tilde = V @ (D_inv_sqrt * (V.T @ mu_shrunk))   # (p,)
+    # Full-space Sigma^{1/2} = V D^{1/2} V'
+    Sigma_sqrt = (V * D_sqrt[np.newaxis, :]) @ V.T
 
-    # --- LARS with ridge augmentation ---
-    # X_aug = [Sigma_tilde; sqrt(lambda_l2)*I_r],  y_aug = [mu_tilde; 0]
-    # (ridge augmentation is handled inside _lars_path)
+    # Full-space Sigma^{-1/2} mu = V D^{-1/2} V' mu
+    mu_tilde = V @ (D_inv_sqrt * (V.T @ mu_shrunk))
+
+    # LARS with ridge augmentation handled inside _lars_path
     _, coef_path = _lars_path(
-        X=Sigma_tilde.T,   # LARS convention: (n_samples=r, n_features=p)
+        X=Sigma_sqrt,
         y=mu_tilde,
         lambda_l2=lambda_l2,
         max_iter=min(p, k_max + 5),
@@ -218,20 +219,23 @@ def _ap_prune_lars(
     if not coef_path:
         return np.zeros(p)
 
-    # --- Walk path to find step closest to k_target within [k_min, k_max] ---
     best_beta = coef_path[-1]
     best_dist = float("inf")
 
     for beta in coef_path:
         k_nonzero = int(np.sum(np.abs(beta) > 1e-10))
+
         if k_nonzero < k_min or k_nonzero > k_max:
             continue
+
         dist = abs(k_nonzero - k_target)
+
         if dist < best_dist:
             best_dist = dist
             best_beta = beta.copy()
+
         if dist == 0:
-            break  # exact match found
+            break
 
     return best_beta
 

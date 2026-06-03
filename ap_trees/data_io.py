@@ -5,7 +5,7 @@ import pandas as pd
 
 try:
     import yfinance as yf
-except ImportError:  # yfinance is only needed if load_yahoo_monthly_benchmark is called
+except ImportError:
     yf = None
 
 from utils import month_end_from_yy_mm

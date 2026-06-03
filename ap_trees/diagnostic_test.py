@@ -7,8 +7,6 @@ STOCK_WEIGHTS_DIR = Path(r"C:\Users\hongv\OneDrive\Tài liệu\forest-through-
 OUT_DIR = WEIGHTS_PATH.parent / "diagnostics_stock_concentration"
 OUT_DIR.mkdir(exist_ok=True)
 
-# Use "tilt_stock_w" to match current optimizer default.
-# Use "base_stock_w" if you want pure value-weighted AP-tree node holdings.
 STOCK_WEIGHT_COL = "tilt_stock_w"
 
 TOP_K = 10

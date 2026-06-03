@@ -27,11 +27,6 @@ from utils import annualized_sharpe
 
 SelectedParams = namedtuple("SelectedParams", ["lambda0", "lambda2", "k", "val_sharpe"])
 
-
-# =============================================================================
-# Helpers
-# =============================================================================
-
 def _candidate_cols(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if c.startswith("port_")]
 

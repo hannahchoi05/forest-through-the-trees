@@ -2,10 +2,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 BASE_DIR = Path(r"C:\Users\hongv\OneDrive\Tài liệu\forest-through-the-trees\ap-trees\outputs\LME_OP_Investment")
 
 WEIGHTS_PATH = BASE_DIR / "weights_A1_static_no_tc_lagged_trade.csv"
@@ -13,15 +9,9 @@ STOCK_WEIGHTS_DIR = BASE_DIR / "stock_weights_by_month_lagged_trade"
 OUT_DIR = BASE_DIR / "diagnostics_return_contributions"
 OUT_DIR.mkdir(exist_ok=True)
 
-# Use this first because current optimizer default uses tilt_stock_w in stock-weight aggregation.
-# Then rerun with base_stock_w as a robustness check.
 STOCK_WEIGHT_COL = "base_stock_w"
 
 TOP_K = 10
-
-# ============================================================
-# LOAD STATIC CANDIDATE WEIGHTS
-# ============================================================
 
 weights_df = pd.read_csv(WEIGHTS_PATH)
 weights_df["candidate"] = weights_df["candidate"].astype(str)
@@ -37,9 +27,6 @@ active_nodes = set(w_map.index)
 print(f"Loaded {len(w_map)} active AP-tree candidate weights.")
 print(f"Using stock weight column: {STOCK_WEIGHT_COL}")
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
 
 records = []
 top_contrib_rows = []
@@ -147,7 +134,6 @@ for idx, f in enumerate(files, start=1):
             "abs_contribution": float(row.abs_contribution),
         })
 
-    # Top holdings by absolute weight
     topw = stock.sort_values("abs_weight", ascending=False).head(TOP_K)
     for rank, row in enumerate(topw.itertuples(index=False), start=1):
         top_weight_rows.append({
@@ -160,10 +146,6 @@ for idx, f in enumerate(files, start=1):
             "contribution": float(row.contribution),
             "abs_weight": float(row.abs_weight),
         })
-
-# ============================================================
-# OUTPUT
-# ============================================================
 
 diag = pd.DataFrame(records)
 top_contrib = pd.DataFrame(top_contrib_rows)

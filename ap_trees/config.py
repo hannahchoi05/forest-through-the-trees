@@ -1,7 +1,7 @@
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent   # ap-trees/
-REPO_ROOT  = SCRIPT_DIR.parent                 # forest-through-the-trees/
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT  = SCRIPT_DIR.parent
 
 DATA_DIR   = REPO_ROOT / "Data"
 CHUNK_DIR  = DATA_DIR / "data_chunk_files_quantile"
@@ -27,8 +27,8 @@ ROLLING_WINDOW = 120
 
 import numpy as np
 
-AP_LAMBDA0_GRID = list(np.round(np.arange(0.0, 0.95, 0.05), 10))  # 19 values {0, 0.05, ..., 0.90}
-AP_LAMBDA2_GRID = list(np.logspace(-5.0, -8.0, 13))                 # 13 log-spaced values 10^{-5} to 10^{-8}
+AP_LAMBDA0_GRID = list(np.round(np.arange(0.0, 0.95, 0.05), 10))
+AP_LAMBDA2_GRID = list(np.logspace(-5.0, -8.0, 13))
 AP_K_MIN = 5
 AP_K_MAX = 50
 AP_PORT_N = 40
